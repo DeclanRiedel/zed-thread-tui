@@ -78,6 +78,33 @@ class RunnerStateTests(unittest.TestCase):
         self.assertEqual(slots[str(project_c)], 9)
         self.assertEqual(RUNNER.project_for_slot(9), project_c)
 
+    def test_pinned_projects_persist_and_unpin(self) -> None:
+        project_a = Path(self.tempdir.name) / "project-a"
+        project_b = Path(self.tempdir.name) / "project-b"
+        project_a.mkdir()
+        project_b.mkdir()
+
+        RUNNER.pin_projects([project_b, project_a])
+        self.assertEqual(RUNNER.pinned_projects(), {project_a, project_b})
+        RUNNER.unpin_projects([project_a])
+        self.assertEqual(RUNNER.pinned_projects(), {project_b})
+
+    def test_pinned_threads_sort_first(self) -> None:
+        project_a = Path(self.tempdir.name) / "project-a"
+        project_b = Path(self.tempdir.name) / "project-b"
+        project_c = Path(self.tempdir.name) / "project-c"
+        for project in (project_a, project_b, project_c):
+            project.mkdir()
+        RUNNER.pin_projects([project_c])
+        ui = RUNNER.RunnerUi(
+            RUNNER.build_threads([project_a, project_b, project_c], None),
+            focus_zed_on_run=False,
+            focus_limit=4,
+            sort_mode="source",
+        )
+
+        self.assertEqual([ui.threads[index].project for index in ui.visible_indices()], [project_c, project_a, project_b])
+
     def test_registered_process_restores_as_running(self) -> None:
         project = Path(self.tempdir.name) / "project"
         project.mkdir()

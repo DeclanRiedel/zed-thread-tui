@@ -17,6 +17,7 @@ Rows start with compact status slots:
 - `.`: idle or clean exit.
 - `!`: stopped, failed, or missing command.
 - `@`: most recently focused/open Zed project from Zed state.
+- `^`: pinned thread, sorted before unpinned rows.
 - `F`: project uses `flake.nix`.
 - `S`: project uses `shell.nix` or `default.nix`.
 - `-`: no nix shell detected.
@@ -29,8 +30,8 @@ Rows start with compact status slots:
 Example:
 
 ```text
-> 01 *@FN project-alpha           running      npm run dev
-  02 . S  project-beta            idle         just test
+> 01 *@^FN project-alpha           running      npm run dev
+  02 .  S  project-beta            idle         just test
 ```
 
 `N` is shown when the runner knows a live command or warm-up process is running for a project with `flake.nix`, `shell.nix`, or `default.nix`. It is process-based: the runner records the process group it started and refreshes whether that process group is still alive. It does not introspect arbitrary external shells.
@@ -49,6 +50,7 @@ Focusing a project after it shows `[AI:done!]` automatically marks that response
 - `f`: focus/open selected project in Zed.
 - `p`: add project path.
 - `h`: hide selected project from the default list.
+- `b`: pin/unpin selected thread.
 - `A` / `U` / `M`: mark selected AI response seen / unchecked / mark all done seen.
 - `s`: start or rerun selected command.
 - `r`: stop all, focus selected project, run selected command.
@@ -69,6 +71,9 @@ nix run . -- --add-project /path/to/project-alpha
 nix run . -- --hide-project /path/to/project-alpha
 nix run . -- --unhide-project /path/to/project-alpha
 nix run . -- --list-hidden
+nix run . -- --pin-project /path/to/project-alpha
+nix run . -- --unpin-project /path/to/project-alpha
+nix run . -- --list-pinned
 nix run . -- --set-preset /path/to/project-alpha dev "npm run dev"
 nix run . -- --list-presets /path/to/project-alpha
 nix run . -- --stop-all

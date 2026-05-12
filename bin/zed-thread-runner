@@ -47,6 +47,7 @@ def default_config() -> dict[str, object]:
         "leader_key": "space",
         "sort_mode": "source",
         "hidden_projects": [],
+        "pinned_projects": [],
     }
 
 
@@ -93,6 +94,31 @@ def unhide_projects(projects: Iterable[Path]) -> list[Path]:
     config["hidden_projects"] = sorted(str(project) for project in hidden)
     save_config(config)
     return sorted(hidden)
+
+
+def pinned_projects() -> set[Path]:
+    raw = load_config().get("pinned_projects", [])
+    if not isinstance(raw, list):
+        return set()
+    return {Path(str(project)).expanduser().resolve() for project in raw}
+
+
+def pin_projects(projects: Iterable[Path]) -> list[Path]:
+    config = load_config()
+    pinned = pinned_projects()
+    pinned.update(project.expanduser().resolve() for project in projects)
+    config["pinned_projects"] = sorted(str(project) for project in pinned)
+    save_config(config)
+    return sorted(pinned)
+
+
+def unpin_projects(projects: Iterable[Path]) -> list[Path]:
+    config = load_config()
+    pinned = pinned_projects()
+    pinned.difference_update(project.expanduser().resolve() for project in projects)
+    config["pinned_projects"] = sorted(str(project) for project in pinned)
+    save_config(config)
+    return sorted(pinned)
 
 
 def load_commands() -> dict[str, str]:
@@ -774,6 +800,7 @@ class RunnerUi:
         self.message = "enter edit | / filter | o sort | t log | c preset | f focus | s run | q quit"
         self.commands = load_commands()
         self.presets = load_presets()
+        self.pinned_projects = pinned_projects()
         self.ai_states: dict[str, dict[str, str | float]] = {}
         self.ai_states_checked_at = 0.0
         self.focused_project: Path | None = None
@@ -838,7 +865,7 @@ class RunnerUi:
             suffix = f" leader={self.leader_key}:{leader_state} slot={pending} filter={self.filter_query or '-'} sort={self.sort_mode}"
             status_attr = curses.A_REVERSE if self.leader_active else curses.A_DIM
             self.write_line(stdscr, height - 2, f"{self.message} |{suffix}", status_attr)
-            buttons = "[Focus:f] [Run:s] [Stop:x/a] [Preset:c/P] [Log:t] [AI:A/U/M] [Quit:q/Q]"
+            buttons = "[Focus:f] [Run:s] [Stop:x/a] [Pin:b] [Preset:c/P] [Log:t] [AI:A/U/M] [Quit:q/Q]"
             self.write_line(stdscr, height - 1, buttons, curses.A_REVERSE)
         stdscr.refresh()
 
@@ -866,9 +893,10 @@ class RunnerUi:
         elif thread.last_status in ("stopped", "missing command") or thread.last_status.startswith(("exited", "warm failed")):
             run = "!"
         focused = "@" if focused_project == thread.project else " "
+        pinned = "^" if self.is_pinned(thread) else " "
         wrapper = {"flake": "F", "shell": "S", "none": "-"}[nix_wrapper_kind(thread.project)]
         active = "N" if wrapper != "-" and run in ("*", "~") else " "
-        return f"{run}{focused}{wrapper}{active}"
+        return f"{run}{focused}{pinned}{wrapper}{active}"
 
     def cached_focused_project(self) -> Path | None:
         now = time.monotonic()
@@ -939,6 +967,8 @@ class RunnerUi:
             self.message = f"hid {removed}"
         elif key == ord("p"):
             self.add_project(stdscr)
+        elif key == ord("b"):
+            self.toggle_pin_current()
         elif key == ord("s"):
             self.start_current(stop_all_first=False)
         elif key == ord("r"):
@@ -1028,22 +1058,56 @@ class RunnerUi:
             if not query or query in thread.name.casefold() or query in str(thread.project).casefold()
         ]
         if self.sort_mode == "source":
-            return indices
+            return sorted(indices, key=lambda idx: (self.pin_priority(self.threads[idx]), idx))
         if self.sort_mode == "name":
-            return sorted(indices, key=lambda idx: self.threads[idx].name.casefold())
+            return sorted(indices, key=lambda idx: (self.pin_priority(self.threads[idx]), self.threads[idx].name.casefold()))
         if self.sort_mode == "running":
-            return sorted(indices, key=lambda idx: (not self.is_running(self.threads[idx]), self.threads[idx].name.casefold()))
+            return sorted(
+                indices,
+                key=lambda idx: (
+                    self.pin_priority(self.threads[idx]),
+                    not self.is_running(self.threads[idx]),
+                    self.threads[idx].name.casefold(),
+                ),
+            )
         if self.sort_mode == "failed":
-            return sorted(indices, key=lambda idx: (not self.is_failed(self.threads[idx]), self.threads[idx].name.casefold()))
+            return sorted(
+                indices,
+                key=lambda idx: (
+                    self.pin_priority(self.threads[idx]),
+                    not self.is_failed(self.threads[idx]),
+                    self.threads[idx].name.casefold(),
+                ),
+            )
         if self.sort_mode == "focused":
-            return sorted(indices, key=lambda idx: (self.threads[idx].project != focused_project, self.threads[idx].name.casefold()))
+            return sorted(
+                indices,
+                key=lambda idx: (
+                    self.pin_priority(self.threads[idx]),
+                    self.threads[idx].project != focused_project,
+                    self.threads[idx].name.casefold(),
+                ),
+            )
         if self.sort_mode == "ai":
-            return sorted(indices, key=lambda idx: (self.ai_priority(self.threads[idx], ai_states), self.threads[idx].name.casefold()))
+            return sorted(
+                indices,
+                key=lambda idx: (
+                    self.pin_priority(self.threads[idx]),
+                    self.ai_priority(self.threads[idx], ai_states),
+                    self.threads[idx].name.casefold(),
+                ),
+            )
         return indices
 
     def ai_priority(self, thread: ThreadCommand, ai_states: dict[str, dict[str, str | float]]) -> int:
         state = ai_states.get(thread.key, {}).get("state")
         return {"running": 0, "done": 1, "seen": 2}.get(str(state), 3)
+
+    def is_pinned(self, thread: ThreadCommand) -> bool:
+        return thread.project.expanduser().resolve() in self.pinned_projects
+
+    def pin_priority(self, thread: ThreadCommand) -> int:
+        return 0 if self.is_pinned(thread) else 1
 
     def is_running(self, thread: ThreadCommand) -> bool:
         return (
@@ -1102,6 +1166,17 @@ class RunnerUi:
             self.slots = ensure_slots(thread.project for thread in self.threads)
             self.selected = len(self.threads) - 1
         self.message = f"registered {project.name} ({len(projects)} total)"
+
+    def toggle_pin_current(self) -> None:
+        project = self.current.project.expanduser().resolve()
+        if project in self.pinned_projects:
+            unpin_projects([project])
+            self.pinned_projects.discard(project)
+            self.message = f"unpinned {self.current.name}"
+            return
+        pin_projects([project])
+        self.pinned_projects.add(project)
+        self.message = f"pinned {self.current.name}"
 
     def cycle_preset(self) -> None:
         project_presets = self.presets.get(self.current.key, {})
@@ -1322,6 +1397,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--list-hidden",
         action="store_true",
         help="List hidden projects and exit.",
+    )
+    parser.add_argument(
+        "--pin-project",
+        action="append",
+        default=[],
+        metavar="PROJECT",
+        help="Pin PROJECT to the top of TUI lists. Can be passed more than once.",
+    )
+    parser.add_argument(
+        "--unpin-project",
+        action="append",
+        default=[],
+        metavar="PROJECT",
+        help="Unpin PROJECT. Can be passed more than once.",
+    )
+    parser.add_argument(
+        "--list-pinned",
+        action="store_true",
+        help="List pinned projects and exit.",
     )
     parser.add_argument(
         "--register-args",
@@ -1647,6 +1741,21 @@ def main(argv: list[str]) -> int:
 
     if args.list_hidden:
         for project in sorted(hidden_projects()):
+            print(project)
+        return 0
+
+    if args.pin_project:
+        for project in pin_projects(Path(project) for project in args.pin_project):
+            print(project)
+        return 0
+
+    if args.unpin_project:
+        for project in unpin_projects(Path(project) for project in args.unpin_project):
+            print(project)
+        return 0
+
+    if args.list_pinned:
+        for project in sorted(pinned_projects()):
             print(project)
         return 0
 

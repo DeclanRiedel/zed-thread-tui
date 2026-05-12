@@ -49,6 +49,7 @@ def default_config() -> dict[str, object]:
         "leader_key": "space",
         "sort_mode": "source",
         "hidden_projects": [],
+        "hidden_threads": [],
         "pinned_projects": [],
         "remote_focus": {},
     }
@@ -203,11 +204,40 @@ def hidden_projects() -> set[Path]:
     return {Path(str(project)).expanduser().resolve() for project in raw}
 
 
+def hidden_thread_keys() -> set[str]:
+    raw = load_config().get("hidden_threads", [])
+    if not isinstance(raw, list):
+        return set()
+    return {str(key) for key in raw}
+
+
+def hide_thread_keys(keys: Iterable[str]) -> list[str]:
+    config = load_config()
+    hidden = hidden_thread_keys()
+    hidden.update(str(key) for key in keys)
+    config["hidden_threads"] = sorted(hidden)
+    save_config(config)
+    return sorted(hidden)
+
+
+def unhide_thread_keys(keys: Iterable[str]) -> list[str]:
+    config = load_config()
+    hidden = hidden_thread_keys()
+    hidden.difference_update(str(key) for key in keys)
+    config["hidden_threads"] = sorted(hidden)
+    save_config(config)
+    return sorted(hidden)
+
+
 def hide_projects(projects: Iterable[Path]) -> list[Path]:
     config = load_config()
     hidden = hidden_projects()
-    hidden.update(project.expanduser().resolve() for project in projects)
+    resolved_projects = [project.expanduser().resolve() for project in projects]
+    hidden.update(resolved_projects)
     config["hidden_projects"] = sorted(str(project) for project in hidden)
+    hidden_threads = hidden_thread_keys()
+    hidden_threads.update(str(project) for project in resolved_projects)
+    config["hidden_threads"] = sorted(hidden_threads)
     save_config(config)
     return sorted(hidden)
 
@@ -215,8 +245,12 @@ def hide_projects(projects: Iterable[Path]) -> list[Path]:
 def unhide_projects(projects: Iterable[Path]) -> list[Path]:
     config = load_config()
     hidden = hidden_projects()
-    hidden.difference_update(project.expanduser().resolve() for project in projects)
+    resolved_projects = [project.expanduser().resolve() for project in projects]
+    hidden.difference_update(resolved_projects)
     config["hidden_projects"] = sorted(str(project) for project in hidden)
+    hidden_threads = hidden_thread_keys()
+    hidden_threads.difference_update(str(project) for project in resolved_projects)
+    config["hidden_threads"] = sorted(hidden_threads)
     save_config(config)
     return sorted(hidden)
 
@@ -798,7 +832,12 @@ def default_projects(cwd: Path, sync_zed: bool) -> list[Path]:
     zed_projects = zed_thread_projects() if sync_zed else []
     discovered = discover_worktrees(cwd)
     hidden = hidden_projects()
-    return [project for project in unique_existing([*registered, *zed_projects, *discovered]) if project not in hidden]
+    hidden_keys = hidden_thread_keys()
+    return [
+        project
+        for project in unique_existing([*registered, *zed_projects, *discovered])
+        if project not in hidden and str(project) not in hidden_keys
+    ]
 
 
 def unique_existing(paths: Iterable[Path]) -> list[Path]:
@@ -1186,11 +1225,7 @@ class RunnerUi:
         elif key == ord("P"):
             self.save_preset(stdscr)
         elif key == ord("h"):
-            hide_projects([self.current.project])
-            removed = self.current.name
-            self.threads.pop(self.selected)
-            self.selected = min(self.selected, max(0, len(self.threads) - 1))
-            self.message = f"hid {removed}"
+            self.hide_current()
         elif key == ord("p"):
             self.add_project(stdscr)
         elif key == ord("b"):
@@ -1392,6 +1427,17 @@ class RunnerUi:
             self.slots = ensure_slot_keys(thread.key for thread in self.threads)
             self.selected = len(self.threads) - 1
         self.message = f"registered {project.name} ({len(projects)} total)"
+
+    def hide_current(self) -> None:
+        thread = self.current
+        if thread.is_remote:
+            hide_thread_keys([thread.key])
+        else:
+            hide_projects([thread.project])
+        removed = thread.name
+        self.threads.pop(self.selected)
+        self.selected = min(self.selected, max(0, len(self.threads) - 1))
+        self.message = f"hid {removed}"
 
     def toggle_pin_current(self) -> None:
         project = self.current.project.expanduser().resolve()
@@ -1637,6 +1683,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="List hidden projects and exit.",
     )
     parser.add_argument(
+        "--hide-thread",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="Hide a thread key from the default TUI list. Supports local paths and ssh:host:/path keys.",
+    )
+    parser.add_argument(
+        "--unhide-thread",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="Unhide a thread key. Supports local paths and ssh:host:/path keys.",
+    )
+    parser.add_argument(
+        "--list-hidden-threads",
+        action="store_true",
+        help="List hidden thread keys and exit.",
+    )
+    parser.add_argument(
         "--pin-project",
         action="append",
         default=[],
@@ -1771,11 +1836,14 @@ def build_threads(projects: list[Path], default_command: str | None) -> list[Thr
 def build_remote_threads(default_command: str | None) -> list[ThreadCommand]:
     commands = load_commands()
     processes = load_processes()
+    hidden = hidden_thread_keys()
     threads: list[ThreadCommand] = []
     for spec in zed_remote_thread_specs():
         host = str(spec["host"])
         remote_path = str(spec["path"])
         key = remote_thread_key(host, remote_path)
+        if key in hidden:
+            continue
         command = commands.get(key, "") or default_command or ""
         thread = ThreadCommand(
             project=Path(remote_path),
@@ -2045,6 +2113,21 @@ def main(argv: list[str]) -> int:
     if args.list_hidden:
         for project in sorted(hidden_projects()):
             print(project)
+        return 0
+
+    if args.hide_thread:
+        for key in hide_thread_keys(args.hide_thread):
+            print(key)
+        return 0
+
+    if args.unhide_thread:
+        for key in unhide_thread_keys(args.unhide_thread):
+            print(key)
+        return 0
+
+    if args.list_hidden_threads:
+        for key in sorted(hidden_thread_keys()):
+            print(key)
         return 0
 
     if args.pin_project:

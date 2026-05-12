@@ -73,6 +73,9 @@ nix run . -- --add-project /path/to/project-alpha
 nix run . -- --hide-project /path/to/project-alpha
 nix run . -- --unhide-project /path/to/project-alpha
 nix run . -- --list-hidden
+nix run . -- --hide-thread 'ssh:devbox:/srv/project'
+nix run . -- --unhide-thread 'ssh:devbox:/srv/project'
+nix run . -- --list-hidden-threads
 nix run . -- --pin-project /path/to/project-alpha
 nix run . -- --unpin-project /path/to/project-alpha
 nix run . -- --list-pinned

@@ -89,6 +89,20 @@ class RunnerStateTests(unittest.TestCase):
         RUNNER.unpin_projects([project_a])
         self.assertEqual(RUNNER.pinned_projects(), {project_b})
 
+    def test_hidden_threads_support_local_and_remote_keys(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        remote_key = RUNNER.remote_thread_key("devbox", "/srv/project")
+
+        RUNNER.hide_projects([project])
+        RUNNER.hide_thread_keys([remote_key])
+        self.assertIn(project, RUNNER.hidden_projects())
+        self.assertEqual(RUNNER.hidden_thread_keys(), {str(project), remote_key})
+        self.assertEqual(RUNNER.default_projects(project, sync_zed=False), [])
+
+        RUNNER.unhide_thread_keys([remote_key])
+        self.assertEqual(RUNNER.hidden_thread_keys(), {str(project)})
+
     def test_pinned_threads_sort_first(self) -> None:
         project_a = Path(self.tempdir.name) / "project-a"
         project_b = Path(self.tempdir.name) / "project-b"
@@ -139,6 +153,8 @@ class RunnerStateTests(unittest.TestCase):
         self.assertEqual(len(threads), 1)
         self.assertTrue(threads[0].is_remote)
         self.assertEqual(threads[0].key, "ssh:declan@devbox:2222:/srv/project")
+        RUNNER.hide_thread_keys([threads[0].key])
+        self.assertEqual(RUNNER.build_remote_threads(None), [])
 
     def test_remote_command_runs_remote_nix_detection(self) -> None:
         command = RUNNER.remote_command_for_project("declan@devbox", "/srv/project", "just test", 2222)

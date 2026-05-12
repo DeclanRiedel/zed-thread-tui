@@ -113,6 +113,8 @@ After `--install-zed-config --slot-count 9`, you can add generated task bindings
 
 The focus action uses `zed --existing <project>`. Zed does not expose a public CLI/API to select an arbitrary existing Agent thread by ID.
 
+The TUI statusline shows the configured leader key, defaulting to `space`, so the slot bindings read as `space f 9`, `space r 9`, and `space x 9`.
+
 ## Development
 
 ```sh

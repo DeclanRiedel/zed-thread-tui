@@ -19,6 +19,7 @@ from typing import Iterable
 
 APP_NAME = "zed-thread-runner"
 ZED_STATE_DIR = Path.home() / ".local" / "share" / "zed"
+MAX_FOCUSED_WORKTREES = 4
 
 
 def state_dir() -> Path:
@@ -63,6 +64,19 @@ def load_projects() -> list[Path]:
     return unique_existing(Path(str(project)) for project in data)
 
 
+def load_focus_history() -> list[Path]:
+    path = state_dir() / "focus-history.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return unique_existing(Path(str(project)) for project in data)
+
+
 def save_commands(commands: dict[str, str]) -> None:
     target = state_dir() / "commands.json"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -71,6 +85,12 @@ def save_commands(commands: dict[str, str]) -> None:
 
 def save_projects(projects: list[Path]) -> None:
     target = state_dir() / "projects.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps([str(project) for project in projects], indent=2) + "\n")
+
+
+def save_focus_history(projects: list[Path]) -> None:
+    target = state_dir() / "focus-history.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps([str(project) for project in projects], indent=2) + "\n")
 
@@ -87,6 +107,17 @@ def remove_projects(projects: Iterable[Path]) -> list[Path]:
     kept = [project for project in load_projects() if project not in removed]
     save_projects(kept)
     return kept
+
+
+def record_focused_project(project: Path, limit: int = MAX_FOCUSED_WORKTREES) -> list[Path]:
+    resolved = project.expanduser().resolve()
+    history = [resolved, *[entry for entry in load_focus_history() if entry != resolved]]
+    kept = history[:limit]
+    popped = history[limit:]
+    save_focus_history(kept)
+    if popped:
+        remove_projects(popped)
+    return popped
 
 
 def save_processes(processes: dict[str, dict[str, int | str]]) -> None:
@@ -282,7 +313,8 @@ def warm_command_for_project(project: Path) -> list[str] | None:
     return None
 
 
-def focus_project_in_zed(project: Path) -> str:
+def focus_project_in_zed(project: Path) -> tuple[str, list[Path]]:
+    popped = record_focused_project(project)
     try:
         subprocess.Popen(
             ["zed", "--existing", str(project)],
@@ -292,8 +324,11 @@ def focus_project_in_zed(project: Path) -> str:
             start_new_session=True,
         )
     except OSError as error:
-        return f"zed focus failed: {error}"
-    return f"focused zed: {project.name}"
+        return f"zed focus failed: {error}", popped
+    if popped:
+        names = ", ".join(path.name for path in popped)
+        return f"focused zed: {project.name}; popped {names}", popped
+    return f"focused zed: {project.name}", popped
 
 
 @dataclass
@@ -500,7 +535,7 @@ class RunnerUi:
         elif key == ord("l"):
             self.message = f"log: {self.current.log_path}"
         elif key in (ord("f"), ord("z")):
-            self.message = focus_project_in_zed(self.current.project)
+            self.focus_current()
 
     @property
     def current(self) -> ThreadCommand:
@@ -559,15 +594,34 @@ class RunnerUi:
         self.commands[self.current.key] = self.current.command
         save_commands(self.commands)
 
+    def focus_current(self) -> None:
+        message, popped = focus_project_in_zed(self.current.project)
+        self.remove_popped_threads(popped)
+        self.message = message
+
+    def remove_popped_threads(self, popped: list[Path]) -> None:
+        if not popped:
+            return
+        popped_set = set(popped)
+        for thread in self.threads:
+            if thread.project in popped_set:
+                thread.stop()
+        self.threads = [thread for thread in self.threads if thread.project not in popped_set]
+        self.selected = min(self.selected, max(0, len(self.threads) - 1))
+
     def start_current(self, stop_all_first: bool) -> None:
+        thread = self.current
         if stop_all_first:
             self.stop_all()
         if self.focus_zed_on_run:
-            self.message = focus_project_in_zed(self.current.project)
-        self.current.start()
-        self.persist_current()
+            message, popped = focus_project_in_zed(thread.project)
+            self.remove_popped_threads(popped)
+            self.message = message
+        thread.start()
+        self.commands[thread.key] = thread.command
+        save_commands(self.commands)
         prefix = "stopped all, " if stop_all_first else ""
-        self.message = f"{prefix}running {self.current.name}"
+        self.message = f"{prefix}running {thread.name}"
 
     def stop_all(self) -> None:
         for thread in self.threads:
@@ -695,7 +749,8 @@ def main(argv: list[str]) -> int:
             stop_all_registered_processes()
         thread = build_threads([project], args.command)[0]
         if args.focus_zed_on_run:
-            print(focus_project_in_zed(project))
+            message, _ = focus_project_in_zed(project)
+            print(message)
         thread.start()
         if thread.process is None:
             print(thread.last_status, file=sys.stderr)

@@ -14,6 +14,8 @@ The TUI merges projects from:
 
 Zed state sync uses internal SQLite files, not a public API, so it may need updates if Zed changes its schema.
 
+The runner caps focused worktrees at 4. Focusing a fifth project pops the oldest focused project from the runner registry/TUI and stops any command it was running.
+
 ## Icons
 
 Rows start with status icons before the project name:

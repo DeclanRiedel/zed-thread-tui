@@ -93,12 +93,13 @@ Inside the TUI, press `p` to add another project path as a runner thread.
 
 - `up` / `down`: select a thread.
 - `enter` or `e`: edit the selected thread command.
+- `f`: focus/open the selected project in the existing Zed window.
 - `p`: add a project path to the persistent runner thread list.
 - `s`: start, or stop and rerun, the selected thread command.
 - `r`: stop all tracked thread commands, focus/open the selected project in Zed when enabled, then run the selected thread command.
 - `x`: stop the selected thread command.
 - `a`: stop all running thread commands.
-- `z`: focus/open the selected project in the existing Zed window.
+- `z`: alias for `f`.
 - `w`: warm the selected project's nix shell.
 - `W`: warm all detected nix shells.
 - `l`: show the selected thread's log path.

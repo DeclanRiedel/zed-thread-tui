@@ -392,7 +392,7 @@ class RunnerUi:
         self.threads = threads
         self.focus_zed_on_run = focus_zed_on_run
         self.selected = 0
-        self.message = "enter/e edit | p add project | s start/rerun | r stop-all+run | x stop | a stop all | q quit"
+        self.message = "enter/e edit | f focus zed | p add project | s start/rerun | r stop-all+run | x stop | q quit"
         self.commands = load_commands()
 
     def run(self, stdscr: curses.window) -> None:
@@ -431,7 +431,7 @@ class RunnerUi:
 
         if height >= 2:
             self.write_line(stdscr, height - 2, self.message, curses.A_DIM)
-            buttons = "[Start/Rerun:s] [Stop:x] [Stop All:a] [Add:p] [Warm:w/W] [Edit:enter] [Quit:q]"
+            buttons = "[Focus:f] [Start/Rerun:s] [Stop:x] [Stop All:a] [Add:p] [Edit:enter] [Quit:q]"
             self.write_line(stdscr, height - 1, buttons, curses.A_REVERSE)
         stdscr.refresh()
 
@@ -473,7 +473,7 @@ class RunnerUi:
             self.message = "warming all nix shells"
         elif key == ord("l"):
             self.message = f"log: {self.current.log_path}"
-        elif key == ord("z"):
+        elif key in (ord("f"), ord("z")):
             self.message = focus_project_in_zed(self.current.project)
 
     @property

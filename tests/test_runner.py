@@ -1,5 +1,6 @@
 import importlib.machinery
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -16,8 +17,10 @@ class RunnerStateTests(unittest.TestCase):
         self.configdir = tempfile.TemporaryDirectory()
         self.old_state = os.environ.get("XDG_STATE_HOME")
         self.old_config = os.environ.get("XDG_CONFIG_HOME")
+        self.old_zed_state = RUNNER.ZED_STATE_DIR
         os.environ["XDG_STATE_HOME"] = self.tempdir.name
         os.environ["XDG_CONFIG_HOME"] = self.configdir.name
+        RUNNER.ZED_STATE_DIR = Path(self.tempdir.name) / "zed"
 
     def tearDown(self) -> None:
         if self.old_state is None:
@@ -28,6 +31,7 @@ class RunnerStateTests(unittest.TestCase):
             os.environ.pop("XDG_CONFIG_HOME", None)
         else:
             os.environ["XDG_CONFIG_HOME"] = self.old_config
+        RUNNER.ZED_STATE_DIR = self.old_zed_state
         self.tempdir.cleanup()
         self.configdir.cleanup()
 
@@ -88,6 +92,40 @@ class RunnerStateTests(unittest.TestCase):
             RUNNER.stop_process_group(os.getpgid(process.pid))
             process.wait(timeout=2)
             RUNNER.unregister_process(project)
+
+    def test_ai_thread_state_done_seen_and_running(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        db_dir = RUNNER.ZED_STATE_DIR / "db" / "0-stable"
+        db_dir.mkdir(parents=True)
+        con = sqlite3.connect(db_dir / "db.sqlite")
+        con.execute(
+            """
+            create table sidebar_threads (
+              thread_id blob,
+              session_id text,
+              agent_id text,
+              title text,
+              updated_at text,
+              folder_paths text,
+              archived integer
+            )
+            """
+        )
+        con.execute(
+            "insert into sidebar_threads values (?, ?, ?, ?, ?, ?, ?)",
+            (b"abc", "session", "agent", "title", "2026-05-12T10:00:00+00:00", str(project), 0),
+        )
+        con.commit()
+        con.close()
+
+        states = RUNNER.zed_ai_thread_metadata(now=RUNNER.parse_zed_timestamp("2026-05-12T10:05:00+00:00"))
+        self.assertEqual(states[str(project)]["state"], "done")
+        RUNNER.save_ai_seen({str(project): "2026-05-12T10:00:00+00:00"})
+        states = RUNNER.zed_ai_thread_metadata(now=RUNNER.parse_zed_timestamp("2026-05-12T10:05:00+00:00"))
+        self.assertEqual(states[str(project)]["state"], "seen")
+        states = RUNNER.zed_ai_thread_metadata(now=RUNNER.parse_zed_timestamp("2026-05-12T10:00:10+00:00"))
+        self.assertEqual(states[str(project)]["state"], "running")
 
 
 if __name__ == "__main__":

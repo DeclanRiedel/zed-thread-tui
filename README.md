@@ -21,6 +21,10 @@ Rows start with compact status slots:
 - `S`: project uses `shell.nix` or `default.nix`.
 - `-`: no nix shell detected.
 - `N`: nix shell is active for that row.
+- `[AI:run]`: Zed Agent thread was updated very recently, treated as responding.
+- `[AI:done!]`: Zed Agent thread updated since you last marked it seen.
+- `[AI:seen]`: latest known Zed Agent update was acknowledged in the TUI.
+- `[AI:-]`: no known Zed Agent state for that project.
 
 Example:
 
@@ -30,6 +34,8 @@ Example:
 ```
 
 `N` is shown when the runner knows a live command or warm-up process is running for a project with `flake.nix`, `shell.nix`, or `default.nix`. It is process-based: the runner records the process group it started and refreshes whether that process group is still alive. It does not introspect arbitrary external shells.
+
+AI badges are best-effort. They read Zed's local thread database, map rows to projects with `folder_paths`, and store acknowledgement state in `ai-seen.json`.
 
 ## Controls
 
@@ -42,6 +48,7 @@ Example:
 - `f`: focus/open selected project in Zed.
 - `p`: add project path.
 - `h`: hide selected project from the default list.
+- `A` / `U` / `M`: mark selected AI response seen / unchecked / mark all done seen.
 - `s`: start or rerun selected command.
 - `r`: stop all, focus selected project, run selected command.
 - `x` / `a`: stop selected / stop all.

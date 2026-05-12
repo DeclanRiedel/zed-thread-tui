@@ -133,6 +133,15 @@ class RunnerStateTests(unittest.TestCase):
 
         self.assertEqual([ui.threads[index].project for index in ui.visible_indices()], [project_c, project_a, project_b])
 
+    def test_thread_state_attr_prioritizes_failed_without_colors(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        ui = RUNNER.RunnerUi([RUNNER.ThreadCommand(project=project, command="")], False, 4, "source")
+        thread = ui.threads[0]
+        thread.last_status = "missing command"
+
+        self.assertTrue(ui.thread_state_attr(thread) & RUNNER.curses.A_BOLD)
+
     def test_remote_focus_uri_and_key_generation(self) -> None:
         self.assertEqual(RUNNER.remote_thread_key("devbox", "~/code/project alpha"), "ssh:devbox:~/code/project alpha")
         self.assertEqual(RUNNER.remote_ssh_uri("devbox", "~/code/project alpha"), "ssh://devbox/~/code/project%20alpha")

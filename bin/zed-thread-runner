@@ -27,6 +27,14 @@ ZED_STATE_REFRESH_SECONDS = 2.0
 AI_RUNNING_WINDOW_SECONDS = 45
 SORT_MODES = ["source", "name", "running", "failed", "focused", "ai"]
 DEFAULT_SLOT_COUNT = 9
+COLOR_DEFAULT = 1
+COLOR_RUNNING = 2
+COLOR_FAILED = 3
+COLOR_WARMING = 4
+COLOR_PINNED = 5
+COLOR_REMOTE = 6
+COLOR_AI_DONE = 7
+COLOR_FOCUSED = 8
 
 
 def state_dir() -> Path:
@@ -1069,6 +1077,7 @@ class RunnerUi:
 
     def run(self, stdscr: curses.window) -> None:
         curses.curs_set(0)
+        self.init_colors()
         stdscr.nodelay(True)
         stdscr.keypad(True)
         while True:
@@ -1112,7 +1121,7 @@ class RunnerUi:
             slot = format_slot(self.slots.get(thread.key))
             line = f"{marker} {slot} {token} {thread.name:<22} {status:<12} {command}"
             line = self.with_right_badge(line, ai_badge(ai_states.get(thread.key)), max(1, width - 1))
-            attr = curses.A_REVERSE if thread_idx == self.selected else curses.A_NORMAL
+            attr = self.row_attr(thread, thread_idx == self.selected, focused_project, focused_remote_key, ai_states.get(thread.key))
             self.write_line(stdscr, row + 1, line, attr)
 
         if self.show_log and height >= 8:
@@ -1143,6 +1152,75 @@ class RunnerUi:
             stdscr.addnstr(row, 0, text.ljust(limit), limit, attr)
         except curses.error:
             pass
+
+    def init_colors(self) -> None:
+        try:
+            has_colors = curses.has_colors()
+        except curses.error:
+            has_colors = False
+        if not has_colors:
+            return
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(COLOR_DEFAULT, -1, -1)
+            curses.init_pair(COLOR_RUNNING, curses.COLOR_GREEN, -1)
+            curses.init_pair(COLOR_FAILED, curses.COLOR_RED, -1)
+            curses.init_pair(COLOR_WARMING, curses.COLOR_CYAN, -1)
+            curses.init_pair(COLOR_PINNED, curses.COLOR_YELLOW, -1)
+            curses.init_pair(COLOR_REMOTE, curses.COLOR_BLUE, -1)
+            curses.init_pair(COLOR_AI_DONE, curses.COLOR_MAGENTA, -1)
+            curses.init_pair(COLOR_FOCUSED, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        except curses.error:
+            pass
+
+    def color_attr(self, color_pair: int) -> int:
+        try:
+            has_colors = curses.has_colors()
+        except curses.error:
+            has_colors = False
+        if not has_colors:
+            return curses.A_NORMAL
+        try:
+            return curses.color_pair(color_pair)
+        except curses.error:
+            return curses.A_NORMAL
+
+    def row_attr(
+        self,
+        thread: ThreadCommand,
+        selected: bool,
+        focused_project: Path | None,
+        focused_remote_key: str | None,
+        ai_state: dict[str, str | float] | None,
+    ) -> int:
+        attr = self.thread_state_attr(thread, focused_project, focused_remote_key, ai_state)
+        if selected:
+            attr |= curses.A_REVERSE
+        return attr
+
+    def thread_state_attr(
+        self,
+        thread: ThreadCommand,
+        focused_project: Path | None = None,
+        focused_remote_key: str | None = None,
+        ai_state: dict[str, str | float] | None = None,
+    ) -> int:
+        if focused_project == thread.project or focused_remote_key == thread.key:
+            return self.color_attr(COLOR_FOCUSED) | curses.A_BOLD
+        if self.is_failed(thread):
+            return self.color_attr(COLOR_FAILED) | curses.A_BOLD
+        if self.is_running(thread):
+            if thread.warm_process is not None and thread.warm_process.poll() is None:
+                return self.color_attr(COLOR_WARMING) | curses.A_BOLD
+            return self.color_attr(COLOR_RUNNING) | curses.A_BOLD
+        if ai_state and ai_state.get("state") == "done":
+            return self.color_attr(COLOR_AI_DONE) | curses.A_BOLD
+        if self.is_pinned(thread):
+            return self.color_attr(COLOR_PINNED) | curses.A_BOLD
+        if thread.is_remote:
+            return self.color_attr(COLOR_REMOTE)
+        return curses.A_NORMAL
 
     def thread_token(self, thread: ThreadCommand, focused_project: Path | None, focused_remote_key: str | None = None) -> str:
         run = "*"

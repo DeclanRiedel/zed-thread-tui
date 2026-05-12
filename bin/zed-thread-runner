@@ -27,6 +27,7 @@ ZED_STATE_REFRESH_SECONDS = 2.0
 AI_RUNNING_WINDOW_SECONDS = 45
 SORT_MODES = ["source", "name", "running", "failed", "focused", "ai"]
 DEFAULT_SLOT_COUNT = 9
+COMMAND_HISTORY_LIMIT = 25
 COLOR_DEFAULT = 1
 COLOR_RUNNING = 2
 COLOR_FAILED = 3
@@ -143,6 +144,38 @@ def save_remote_focus_target(host: str, path: str, target: str) -> dict[str, str
     return targets
 
 
+def load_remote_nix_cache() -> dict[str, str]:
+    path = state_dir() / "remote-nix.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): str(value) for key, value in data.items() if str(value) in ("flake", "shell", "none")}
+
+
+def save_remote_nix_cache(cache: dict[str, str]) -> None:
+    target = state_dir() / "remote-nix.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
+
+
+def cached_remote_nix_kind(host: str, path: str) -> str | None:
+    return load_remote_nix_cache().get(remote_thread_key(host, path))
+
+
+def save_remote_nix_kind(host: str, path: str, kind: str) -> str:
+    if kind not in ("flake", "shell", "none"):
+        kind = "none"
+    cache = load_remote_nix_cache()
+    cache[remote_thread_key(host, path)] = kind
+    save_remote_nix_cache(cache)
+    return kind
+
+
 def remote_focus_template_values(host: str, path: str) -> dict[str, str]:
     normalized_path = remote_path_key(path)
     return {
@@ -155,9 +188,15 @@ def remote_focus_template_values(host: str, path: str) -> dict[str, str]:
     }
 
 
-def remote_shell_command(path: str, command: str) -> str:
+def remote_shell_command(path: str, command: str, nix_kind: str = "auto") -> str:
     quoted_path = shlex.quote(remote_path_key(path))
     quoted_command = shlex.quote(command)
+    if nix_kind == "flake":
+        return f"cd {quoted_path} && nix develop --command bash -lc {quoted_command}"
+    if nix_kind == "shell":
+        return f"cd {quoted_path} && nix-shell --run {quoted_command}"
+    if nix_kind == "none":
+        return f"cd {quoted_path} && bash -lc {quoted_command}"
     return (
         f"cd {quoted_path} && "
         "if [ -f flake.nix ]; then "
@@ -170,7 +209,27 @@ def remote_shell_command(path: str, command: str) -> str:
     )
 
 
-def remote_command_for_project(host: str, path: str, command: str, port: int | None = None) -> list[str]:
+def remote_detect_nix_command(path: str) -> str:
+    quoted_path = shlex.quote(remote_path_key(path))
+    return (
+        f"cd {quoted_path} && "
+        "if [ -f flake.nix ]; then echo flake; "
+        "elif [ -f shell.nix ] || [ -f default.nix ]; then echo shell; "
+        "else echo none; "
+        "fi"
+    )
+
+
+def remote_warm_shell_command(path: str, nix_kind: str) -> str:
+    quoted_path = shlex.quote(remote_path_key(path))
+    if nix_kind == "flake":
+        return f"cd {quoted_path} && nix develop --command true"
+    if nix_kind == "shell":
+        return f"cd {quoted_path} && nix-shell --run true"
+    return f"cd {quoted_path} && true"
+
+
+def remote_ssh_command(host: str, remote_command: str, port: int | None = None) -> list[str]:
     ssh_command = ["ssh"]
     ssh_host = host
     if port:
@@ -178,8 +237,44 @@ def remote_command_for_project(host: str, path: str, command: str, port: int | N
         suffix = f":{port}"
         if ssh_host.endswith(suffix):
             ssh_host = ssh_host[: -len(suffix)]
-    ssh_command.extend([ssh_host, remote_shell_command(path, command)])
+    ssh_command.extend([ssh_host, remote_command])
     return ssh_command
+
+
+def remote_command_for_project(
+    host: str,
+    path: str,
+    command: str,
+    port: int | None = None,
+    nix_kind: str = "auto",
+) -> list[str]:
+    return remote_ssh_command(host, remote_shell_command(path, command, nix_kind), port)
+
+
+def remote_warm_command_for_project(host: str, path: str, port: int | None, nix_kind: str) -> list[str] | None:
+    if nix_kind == "none":
+        return None
+    return remote_ssh_command(host, remote_warm_shell_command(path, nix_kind), port)
+
+
+def detect_remote_nix_kind(host: str, path: str, port: int | None = None, timeout: float = 8.0) -> str:
+    key = remote_thread_key(host, path)
+    cached = load_remote_nix_cache().get(key)
+    if cached:
+        return cached
+    try:
+        result = subprocess.run(
+            remote_ssh_command(host, remote_detect_nix_command(path), port),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return save_remote_nix_kind(host, path, "none")
+    kind = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "none"
+    return save_remote_nix_kind(host, path, kind)
 
 
 def remote_focus_command(host: str, path: str, target: str | None = None) -> list[str]:
@@ -304,6 +399,29 @@ def load_commands() -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items()}
 
 
+def load_command_history() -> dict[str, list[str]]:
+    path = state_dir() / "command-history.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    history: dict[str, list[str]] = {}
+    for key, values in data.items():
+        if not isinstance(values, list):
+            continue
+        commands = []
+        for value in values:
+            command = str(value).strip()
+            if command and command not in commands:
+                commands.append(command)
+        history[str(key)] = commands[:COMMAND_HISTORY_LIMIT]
+    return history
+
+
 def load_processes() -> dict[str, dict[str, int | str]]:
     path = state_dir() / "processes.json"
     if not path.exists():
@@ -383,6 +501,41 @@ def save_commands(commands: dict[str, str]) -> None:
     target = state_dir() / "commands.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(commands, indent=2, sort_keys=True) + "\n")
+
+
+def save_command_history(history: dict[str, list[str]]) -> None:
+    target = state_dir() / "command-history.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(history, indent=2, sort_keys=True) + "\n")
+
+
+def record_command_history(key: str, command: str, limit: int = COMMAND_HISTORY_LIMIT) -> list[str]:
+    command = command.strip()
+    if not command:
+        return load_command_history().get(key, [])
+    history = load_command_history()
+    entries = [command, *[entry for entry in history.get(key, []) if entry != command]]
+    history[key] = entries[:limit]
+    save_command_history(history)
+    return history[key]
+
+
+def common_prefix(values: list[str]) -> str:
+    if not values:
+        return ""
+    prefix = values[0]
+    for value in values[1:]:
+        while not value.startswith(prefix) and prefix:
+            prefix = prefix[:-1]
+    return prefix
+
+
+def complete_command_value(value: str, candidates: list[str]) -> str:
+    matches = [candidate for candidate in candidates if candidate.startswith(value) and candidate != value]
+    if not matches:
+        return value
+    prefix = common_prefix(matches)
+    return prefix if len(prefix) > len(value) else matches[0]
 
 
 def save_ai_seen(seen: dict[str, str]) -> None:
@@ -1022,13 +1175,17 @@ class ThreadCommand:
             self.last_status = "missing command"
             return
         self.stop()
+        nix_kind = "auto"
+        if self.is_remote:
+            self.last_status = "detecting nix"
+            nix_kind = detect_remote_nix_kind(str(self.remote_host), str(self.remote_path), self.remote_port)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("ab", buffering=0) as log:
             header = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.command}\n".encode()
             log.write(header)
             popen_cwd = None if self.is_remote else self.project
             self.process = subprocess.Popen(
-                self.command_argv(),
+                self.command_argv(nix_kind),
                 cwd=popen_cwd,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -1039,14 +1196,33 @@ class ThreadCommand:
         self.last_status = "running"
         self.last_exit = None
 
-    def command_argv(self) -> list[str]:
+    def command_argv(self, nix_kind: str = "auto") -> list[str]:
         if self.is_remote:
-            return remote_command_for_project(str(self.remote_host), str(self.remote_path), self.command, self.remote_port)
+            return remote_command_for_project(str(self.remote_host), str(self.remote_path), self.command, self.remote_port, nix_kind)
         return command_for_project(self.project, self.command)
 
     def warm(self) -> None:
         if self.is_remote:
-            self.last_status = "remote warm skipped"
+            if self.warm_process is not None and self.warm_process.poll() is None:
+                self.last_status = "warming"
+                return
+            self.last_status = "detecting nix"
+            nix_kind = detect_remote_nix_kind(str(self.remote_host), str(self.remote_path), self.remote_port)
+            warm_command = remote_warm_command_for_project(str(self.remote_host), str(self.remote_path), self.remote_port, nix_kind)
+            if warm_command is None:
+                self.last_status = "no nix shell"
+                return
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("ab", buffering=0) as log:
+                log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] warming remote nix shell ({nix_kind})\n".encode())
+                self.warm_process = subprocess.Popen(
+                    warm_command,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    preexec_fn=os.setsid,
+                )
+            self.last_status = "warming"
             return
         warm_command = warm_command_for_project(self.project)
         if warm_command is None:
@@ -1341,10 +1517,10 @@ class RunnerUi:
         if self.is_leader_key(key):
             self.leader_active = not self.leader_active
             self.leader_slot_digits = ""
-            self.message = "leader active: use <id>f, <id>r, <id>x" if self.leader_active else "leader off"
+            self.message = "leader active: use <id>e/f/r/x" if self.leader_active else "leader off"
             return
         if self.leader_active:
-            self.handle_leader_key(key)
+            self.handle_leader_key(stdscr, key)
             return
         if key in (curses.KEY_UP, ord("k")):
             self.move_selection(-1)
@@ -1405,17 +1581,17 @@ class RunnerUi:
             return key == ord(" ")
         return len(self.leader_key) == 1 and key == ord(self.leader_key)
 
-    def handle_leader_key(self, key: int) -> None:
+    def handle_leader_key(self, stdscr: curses.window, key: int) -> None:
         if ord("0") <= key <= ord("9"):
             self.leader_slot_digits += chr(key)
-            self.message = f"leader slot {self.leader_slot_digits}: f focus | r run | x stop"
+            self.message = f"leader slot {self.leader_slot_digits}: e edit | f focus | r run | x stop"
             return
-        if key in (ord("f"), ord("r"), ord("x")):
+        if key in (ord("e"), ord("f"), ord("r"), ord("x")):
             if not self.leader_slot_digits:
-                self.message = "leader needs slot number first, e.g. <leader>9f"
+                self.message = "leader needs slot number first, e.g. <leader>9e"
                 return
             slot = int(self.leader_slot_digits)
-            self.run_leader_slot_action(slot, chr(key))
+            self.run_leader_slot_action(stdscr, slot, chr(key))
             self.leader_active = False
             self.leader_slot_digits = ""
             return
@@ -1424,15 +1600,17 @@ class RunnerUi:
             self.leader_slot_digits = ""
             self.message = "leader off"
             return
-        self.message = "leader: use digits then f/r/x, or leader again to cancel"
+        self.message = "leader: use digits then e/f/r/x, or leader again to cancel"
 
-    def run_leader_slot_action(self, slot: int, action: str) -> None:
+    def run_leader_slot_action(self, stdscr: curses.window, slot: int, action: str) -> None:
         thread = self.thread_for_slot(slot)
         if thread is None:
             self.message = f"slot {slot} not found"
             return
         self.selected = self.threads.index(thread)
-        if action == "f":
+        if action == "e":
+            self.edit_command(stdscr)
+        elif action == "f":
             self.focus_current()
         elif action == "r":
             self.start_current(stop_all_first=True)
@@ -1550,10 +1728,11 @@ class RunnerUi:
         self.message = f"filter: {self.filter_query or '-'}"
 
     def edit_command(self, stdscr: curses.window) -> None:
-        command = self.read_prompt(stdscr, f"command for {self.current.name}: ", self.current.command)
+        command = self.read_command_prompt(stdscr, self.current)
         if command:
             self.current.command = command
             self.persist_current()
+            record_command_history(self.current.key, command)
             self.message = f"set {self.current.name}: {command}"
 
     def add_project(self, stdscr: curses.window) -> None:
@@ -1716,6 +1895,109 @@ class RunnerUi:
             stdscr.nodelay(True)
         return raw.decode(errors="replace").strip()
 
+    def read_command_prompt(self, stdscr: curses.window, thread: ThreadCommand) -> str:
+        history = load_command_history().get(thread.key, [])
+        if thread.command and thread.command not in history:
+            history = [thread.command, *history]
+        preset_commands = sorted(set(self.presets.get(thread.key, {}).values()))
+        completions = []
+        for command in [*history, *preset_commands]:
+            if command and command not in completions:
+                completions.append(command)
+        prompt = f"command for {thread.name}: "
+        return self.read_history_prompt(stdscr, prompt, thread.command, history, completions)
+
+    def read_history_prompt(
+        self,
+        stdscr: curses.window,
+        prompt: str,
+        initial: str,
+        history: list[str],
+        completions: list[str] | None = None,
+    ) -> str:
+        stdscr.nodelay(False)
+        curses.noecho()
+        curses.curs_set(1)
+        height, width = stdscr.getmaxyx()
+        input_width = max(1, width - 1)
+        if len(prompt) >= input_width:
+            prompt = "> "
+        max_value_width = max(1, input_width - len(prompt))
+        value = initial
+        cursor = len(value)
+        history_index: int | None = None
+        completions = completions or history
+
+        def redraw() -> None:
+            shown = value[-max_value_width:]
+            self.write_line(stdscr, height - 1, "")
+            try:
+                stdscr.addnstr(height - 1, 0, prompt, input_width)
+                stdscr.addnstr(height - 1, len(prompt), shown, max_value_width)
+                stdscr.move(height - 1, min(input_width - 1, len(prompt) + min(cursor, max_value_width)))
+            except curses.error:
+                pass
+            stdscr.refresh()
+
+        try:
+            while True:
+                redraw()
+                key = stdscr.getch()
+                if key in (curses.KEY_ENTER, 10, 13):
+                    return value.strip()
+                if key in (27,):
+                    return initial.strip()
+                if key in (9, curses.KEY_BTAB):
+                    completed = complete_command_value(value[:cursor], completions)
+                    if completed != value[:cursor]:
+                        value = completed + value[cursor:]
+                        cursor = len(completed)
+                    continue
+                if key in (curses.KEY_UP,):
+                    if history:
+                        history_index = 0 if history_index is None else min(len(history) - 1, history_index + 1)
+                        value = history[history_index]
+                        cursor = len(value)
+                    continue
+                if key in (curses.KEY_DOWN,):
+                    if history_index is None:
+                        continue
+                    history_index -= 1
+                    if history_index < 0:
+                        history_index = None
+                        value = initial
+                    else:
+                        value = history[history_index]
+                    cursor = len(value)
+                    continue
+                if key in (curses.KEY_LEFT,):
+                    cursor = max(0, cursor - 1)
+                    continue
+                if key in (curses.KEY_RIGHT,):
+                    cursor = min(len(value), cursor + 1)
+                    continue
+                if key in (curses.KEY_HOME,):
+                    cursor = 0
+                    continue
+                if key in (curses.KEY_END,):
+                    cursor = len(value)
+                    continue
+                if key in (curses.KEY_BACKSPACE, 127, 8):
+                    if cursor > 0:
+                        value = value[: cursor - 1] + value[cursor:]
+                        cursor -= 1
+                    continue
+                if key == curses.KEY_DC:
+                    if cursor < len(value):
+                        value = value[:cursor] + value[cursor + 1 :]
+                    continue
+                if 0 <= key <= 255 and chr(key).isprintable():
+                    value = value[:cursor] + chr(key) + value[cursor:]
+                    cursor += 1
+        finally:
+            curses.curs_set(0)
+            stdscr.nodelay(True)
+
     def choose_entry(self, stdscr: curses.window, title: str, entries: list[str]) -> str | None:
         selected = 0
         stdscr.nodelay(False)
@@ -1785,6 +2067,7 @@ class RunnerUi:
         thread.start()
         self.commands[thread.key] = thread.command
         save_commands(self.commands)
+        record_command_history(thread.key, thread.command)
         prefix = "stopped all, " if stop_all_first else ""
         self.message = f"{prefix}running {thread.name}"
 

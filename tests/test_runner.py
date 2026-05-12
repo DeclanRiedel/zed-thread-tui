@@ -78,6 +78,27 @@ class RunnerStateTests(unittest.TestCase):
         self.assertEqual(slots[str(project_c)], 9)
         self.assertEqual(RUNNER.project_for_slot(9), project_c)
 
+    def test_command_history_deduplicates_and_limits(self) -> None:
+        key = "ssh:devbox:/srv/project"
+        RUNNER.record_command_history(key, "just test", limit=3)
+        RUNNER.record_command_history(key, "npm run dev", limit=3)
+        RUNNER.record_command_history(key, "just test", limit=3)
+        RUNNER.record_command_history(key, "pytest", limit=3)
+        RUNNER.record_command_history(key, "cargo test", limit=3)
+
+        self.assertEqual(RUNNER.load_command_history()[key], ["cargo test", "pytest", "just test"])
+
+    def test_command_completion_uses_common_prefix_or_first_match(self) -> None:
+        self.assertEqual(
+            RUNNER.complete_command_value("npm", ["npm run dev", "npm run test", "just test"]),
+            "npm run ",
+        )
+        self.assertEqual(
+            RUNNER.complete_command_value("just", ["npm run dev", "just test"]),
+            "just test",
+        )
+        self.assertEqual(RUNNER.complete_command_value("cargo", ["just test"]), "cargo")
+
     def test_pinned_projects_persist_and_unpin(self) -> None:
         project_a = Path(self.tempdir.name) / "project-a"
         project_b = Path(self.tempdir.name) / "project-b"
@@ -179,12 +200,24 @@ class RunnerStateTests(unittest.TestCase):
         RUNNER.hide_thread_keys([threads[0].key])
         self.assertEqual(RUNNER.build_remote_threads(None), [])
 
-    def test_remote_command_runs_remote_nix_detection(self) -> None:
-        command = RUNNER.remote_command_for_project("declan@devbox", "/srv/project", "just test", 2222)
+    def test_remote_command_uses_cached_nix_kind(self) -> None:
+        command = RUNNER.remote_command_for_project("declan@devbox", "/srv/project", "just test", 2222, "flake")
         self.assertEqual(command[:4], ["ssh", "-p", "2222", "declan@devbox"])
         self.assertIn("cd /srv/project", command[-1])
         self.assertIn("nix develop", command[-1])
-        self.assertIn("nix-shell", command[-1])
+        self.assertNotIn("nix-shell", command[-1])
+
+    def test_remote_nix_cache_persists(self) -> None:
+        RUNNER.save_remote_nix_kind("declan@devbox", "/srv/project", "flake")
+        self.assertEqual(RUNNER.cached_remote_nix_kind("declan@devbox", "/srv/project"), "flake")
+        self.assertEqual(RUNNER.detect_remote_nix_kind("declan@devbox", "/srv/project", timeout=0.01), "flake")
+
+    def test_remote_warm_command_uses_detected_wrapper(self) -> None:
+        command = RUNNER.remote_warm_command_for_project("declan@devbox", "/srv/project", 2222, "shell")
+        self.assertIsNotNone(command)
+        self.assertEqual(command[:4], ["ssh", "-p", "2222", "declan@devbox"])
+        self.assertIn("nix-shell --run true", command[-1])
+        self.assertIsNone(RUNNER.remote_warm_command_for_project("declan@devbox", "/srv/project", 2222, "none"))
 
     def test_current_zed_project_ignores_ambiguous_workspace_timestamps(self) -> None:
         base = Path(self.tempdir.name)

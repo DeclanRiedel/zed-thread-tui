@@ -36,6 +36,7 @@ Example:
 ```
 
 `N` is shown when the runner knows a live command or warm-up process is running for a project with `flake.nix`, `shell.nix`, or `default.nix`. It is process-based: the runner records the process group it started and refreshes whether that process group is still alive. It does not introspect arbitrary external shells.
+Remote rows cache nix wrapper detection in `remote-nix.json`. Press `w` on a remote row to probe/warm the remote nix shell; later runs reuse the cached wrapper instead of probing on every command.
 
 AI badges are best-effort. They read Zed's local thread database, map rows to projects with `folder_paths`, and store acknowledgement state in `ai-seen.json`.
 Focusing a project after it shows `[AI:done!]` automatically marks that response `[AI:seen]`.
@@ -51,7 +52,7 @@ When the terminal supports color, rows are color-coded by priority: focused, fai
 - `up` / `down`: select thread.
 - `/` / `u`: filter / clear filter.
 - `o`: cycle sort mode.
-- `enter` / `e`: edit command.
+- `enter` / `e`: edit command. In the command prompt, `up` / `down` cycle that thread's command history and `tab` completes from history/presets.
 - `c` / `P`: cycle preset / save current command as preset.
 - `t`: toggle log tail pane.
 - `f`: focus/open selected project in Zed.
@@ -65,6 +66,7 @@ When the terminal supports color, rows are color-coded by priority: focused, fai
 - `w` / `W`: warm selected/all nix shells.
 - `q` / `Q`: quit and leave commands running / quit and stop all.
 - `<leader>`: toggle leader mode and change the statusline color.
+- `<leader>9e`: edit command for slot 9 from inside the TUI.
 - `<leader>9f`: focus slot 9 from inside the TUI.
 - `<leader>9r`: stop all and run slot 9 from inside the TUI.
 - `<leader>9x`: stop slot 9 from inside the TUI.

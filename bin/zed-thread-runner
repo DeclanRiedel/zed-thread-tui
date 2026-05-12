@@ -225,6 +225,24 @@ def zed_thread_projects() -> list[Path]:
     return unique_existing(paths)
 
 
+def current_zed_project() -> Path | None:
+    paths: list[Path] = []
+    paths.extend(
+        query_zed_paths(
+            ZED_STATE_DIR / "db" / "0-stable" / "db.sqlite",
+            "select paths from workspaces where paths is not null and paths != '' order by timestamp desc limit 1",
+        )
+    )
+    paths.extend(
+        query_zed_paths(
+            ZED_STATE_DIR / "db" / "0-stable" / "db.sqlite",
+            "select folder_paths from sidebar_threads where archived = 0 and folder_paths is not null and folder_paths != '' order by updated_at desc limit 1",
+        )
+    )
+    existing = unique_existing(paths)
+    return existing[0] if existing else None
+
+
 def default_projects(cwd: Path, sync_zed: bool) -> list[Path]:
     registered = load_projects()
     zed_projects = zed_thread_projects() if sync_zed else []
@@ -262,12 +280,6 @@ def warm_command_for_project(project: Path) -> list[str] | None:
     if (project / "shell.nix").exists() or (project / "default.nix").exists():
         return ["nix-shell", "--run", "true"]
     return None
-
-
-def format_pid(process: subprocess.Popen[bytes] | None) -> str:
-    if process is None:
-        return "-"
-    return str(process.pid) if process.poll() is None else "-"
 
 
 def focus_project_in_zed(project: Path) -> str:
@@ -419,13 +431,14 @@ class RunnerUi:
             return
         title = "Zed thread runner"
         self.write_line(stdscr, 0, title, curses.A_REVERSE)
+        focused_project = current_zed_project()
 
         for idx, thread in enumerate(self.threads[: max(0, height - 3)]):
             marker = ">" if idx == self.selected else " "
-            status = thread.last_status
-            pid = format_pid(thread.process)
+            token = self.thread_token(thread, focused_project)
             command = thread.command or "<enter command>"
-            line = f"{marker} {thread.name:<24} pid {pid:<7} {status:<14} {command}"
+            status = thread.last_status
+            line = f"{marker} {token} {thread.name:<24} {status:<13} {command}"
             attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
             self.write_line(stdscr, idx + 1, line, attr)
 
@@ -446,6 +459,19 @@ class RunnerUi:
             stdscr.addnstr(row, 0, text.ljust(limit), limit, attr)
         except curses.error:
             pass
+
+    def thread_token(self, thread: ThreadCommand, focused_project: Path | None) -> str:
+        run = "*"
+        if thread.warm_process is not None and thread.warm_process.poll() is None:
+            run = "~"
+        elif thread.process is not None and thread.process.poll() is None:
+            run = "*"
+        elif thread.last_status.startswith(("exited 0", "idle", "nix warmed")):
+            run = "."
+        elif thread.last_status in ("stopped", "missing command") or thread.last_status.startswith(("exited", "warm failed")):
+            run = "!"
+        focused = "@" if focused_project == thread.project else " "
+        return f"{run}{focused}"
 
     def handle_key(self, stdscr: curses.window, key: int) -> None:
         if key in (curses.KEY_UP, ord("k")):

@@ -91,6 +91,14 @@ Inside the TUI, press `p` to add another project path as a runner thread.
 
 ## Controls
 
+Thread rows start with two compact indicator slots:
+
+- `*`: command is running.
+- `~`: nix shell warm-up is running.
+- `.`: idle or cleanly exited.
+- `!`: stopped, failed, or missing command.
+- `@`: project appears to be the most recently focused/open Zed project from Zed's local state.
+
 - `up` / `down`: select a thread.
 - `enter` or `e`: edit the selected thread command.
 - `f`: focus/open the selected project in the existing Zed window.

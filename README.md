@@ -25,8 +25,8 @@ Rows start with compact status slots:
 Example:
 
 ```text
-> *@FN project-alpha             running      npm run dev
-  . S  project-beta              idle         just test
+> 01 *@FN project-alpha           running      npm run dev
+  02 . S  project-beta            idle         just test
 ```
 
 `N` is shown when the runner knows a live command or warm-up process is running for a project with `flake.nix`, `shell.nix`, or `default.nix`. It is process-based: the runner records the process group it started and refreshes whether that process group is still alive. It does not introspect arbitrary external shells.
@@ -62,6 +62,11 @@ nix run . -- --list-presets /path/to/project-alpha
 nix run . -- --stop-all
 nix run . -- --focus-limit 4
 nix run . -- --install-zed-config
+nix run . -- --list-slots
+nix run . -- --reassign-slot /path/to/project-alpha 9
+nix run . -- --focus-id 9
+nix run . -- --stop-all-first --focus-zed-on-run --run-id 9
+nix run . -- --stop-id 9
 ```
 
 ## Zed
@@ -89,6 +94,19 @@ Useful keybindings:
   "bindings": {
     "alt-r": ["terminal::SendText", "r"],
     "alt-z": ["terminal::SendText", "f"]
+  }
+}
+```
+
+After `--install-zed-config --slot-count 9`, you can add generated task bindings for fast slot access:
+
+```jsonc
+{
+  "context": "Workspace",
+  "bindings": {
+    "space f 9": ["task::Spawn", { "task_name": "thread runner: focus 9" }],
+    "space r 9": ["task::Spawn", { "task_name": "thread runner: stop all then run 9" }],
+    "space x 9": ["task::Spawn", { "task_name": "thread runner: stop 9" }]
   }
 }
 ```

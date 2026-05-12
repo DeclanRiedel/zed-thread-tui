@@ -58,6 +58,22 @@ class RunnerStateTests(unittest.TestCase):
         self.assertEqual(RUNNER.nix_wrapper_kind(shell_project), "shell")
         self.assertEqual(RUNNER.nix_wrapper_kind(plain_project), "none")
 
+    def test_slots_are_stable_and_reassignable(self) -> None:
+        base = Path(self.tempdir.name)
+        project_a = base / "project-a"
+        project_b = base / "project-b"
+        project_c = base / "project-c"
+        for project in (project_a, project_b, project_c):
+            project.mkdir()
+        slots = RUNNER.ensure_slots([project_a, project_b])
+        self.assertEqual(slots[str(project_a)], 1)
+        self.assertEqual(slots[str(project_b)], 2)
+        self.assertEqual(RUNNER.project_for_slot(2), project_b)
+        RUNNER.reassign_slot(project_c, 9)
+        slots = RUNNER.ensure_slots([project_a, project_b, project_c])
+        self.assertEqual(slots[str(project_c)], 9)
+        self.assertEqual(RUNNER.project_for_slot(9), project_c)
+
     def test_registered_process_restores_as_running(self) -> None:
         project = Path(self.tempdir.name) / "project"
         project.mkdir()

@@ -78,6 +78,14 @@ class RunnerStateTests(unittest.TestCase):
         self.assertEqual(slots[str(project_c)], 9)
         self.assertEqual(RUNNER.project_for_slot(9), project_c)
 
+    def test_remote_slot_key_resolution(self) -> None:
+        key = RUNNER.remote_thread_key("devbox", "/srv/project")
+        RUNNER.save_slots({key: 9})
+
+        self.assertEqual(RUNNER.key_for_slot(9), key)
+        self.assertIsNone(RUNNER.project_for_slot(9))
+        self.assertEqual(RUNNER.remote_parts_from_key(key), ("devbox", "/srv/project"))
+
     def test_command_history_deduplicates_and_limits(self) -> None:
         key = "ssh:devbox:/srv/project"
         RUNNER.record_command_history(key, "just test", limit=3)
@@ -98,6 +106,55 @@ class RunnerStateTests(unittest.TestCase):
             "just test",
         )
         self.assertEqual(RUNNER.complete_command_value("cargo", ["just test"]), "cargo")
+
+    def test_thread_aliases_apply_to_local_and_remote_threads(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        RUNNER.set_thread_alias(str(project), "api")
+        self.assertEqual(RUNNER.load_aliases()[str(project)], "api")
+        threads = RUNNER.build_threads([project], None)
+        self.assertEqual(threads[0].name, "api")
+        self.assertEqual(threads[0].base_name, "project")
+
+        remote_key = RUNNER.remote_thread_key("devbox", "/srv/project")
+        RUNNER.set_thread_alias(remote_key, "remote-api")
+        self.assertEqual(RUNNER.load_aliases()[remote_key], "remote-api")
+        RUNNER.unset_thread_alias(remote_key)
+        self.assertNotIn(remote_key, RUNNER.load_aliases())
+
+    def test_compact_row_uses_short_status_and_alias(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        thread = RUNNER.ThreadCommand(project=project, command="npm run dev", alias="api")
+        ui = RUNNER.RunnerUi([thread], False, 4, "source")
+
+        row = ui.compact_row(">", "01", "* ^FN", thread, "running", "npm run dev")
+
+        self.assertIn("api", row)
+        self.assertIn("run", row)
+        self.assertLess(len(row), 80)
+
+    def test_thread_details_include_local_metadata(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        (project / "flake.nix").write_text("{}")
+        thread = RUNNER.ThreadCommand(project=project, command="just test", alias="api")
+        ui = RUNNER.RunnerUi([thread], False, 4, "source")
+
+        details = "\n".join(ui.thread_details(thread))
+
+        self.assertIn("name: api", details)
+        self.assertIn("command: just test", details)
+        self.assertIn("nix: flake", details)
+
+    def test_command_history_picker_empty_state(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        ui = RUNNER.RunnerUi([RUNNER.ThreadCommand(project=project, command="")], False, 4, "source")
+
+        ui.pick_command_history(None)
+
+        self.assertIn("no command history", ui.message)
 
     def test_pinned_projects_persist_and_unpin(self) -> None:
         project_a = Path(self.tempdir.name) / "project-a"

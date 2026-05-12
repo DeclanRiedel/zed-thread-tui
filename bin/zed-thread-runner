@@ -57,6 +57,7 @@ def default_config() -> dict[str, object]:
         "focus_limit": MAX_FOCUSED_WORKTREES,
         "leader_key": "space",
         "sort_mode": "source",
+        "compact": False,
         "trust_zed_focus": False,
         "hidden_projects": [],
         "hidden_threads": [],
@@ -422,6 +423,19 @@ def load_command_history() -> dict[str, list[str]]:
     return history
 
 
+def load_aliases() -> dict[str, str]:
+    path = state_dir() / "aliases.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): str(value) for key, value in data.items() if str(value).strip()}
+
+
 def load_processes() -> dict[str, dict[str, int | str]]:
     path = state_dir() / "processes.json"
     if not path.exists():
@@ -520,6 +534,38 @@ def record_command_history(key: str, command: str, limit: int = COMMAND_HISTORY_
     return history[key]
 
 
+def save_aliases(aliases: dict[str, str]) -> None:
+    target = state_dir() / "aliases.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(aliases, indent=2, sort_keys=True) + "\n")
+
+
+def normalize_thread_key(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith("ssh:"):
+        return text
+    return str(Path(text).expanduser().resolve())
+
+
+def set_thread_alias(key: str, alias: str) -> dict[str, str]:
+    aliases = load_aliases()
+    normalized = normalize_thread_key(key)
+    alias = alias.strip()
+    if alias:
+        aliases[normalized] = alias
+    else:
+        aliases.pop(normalized, None)
+    save_aliases(aliases)
+    return aliases
+
+
+def unset_thread_alias(key: str) -> dict[str, str]:
+    aliases = load_aliases()
+    aliases.pop(normalize_thread_key(key), None)
+    save_aliases(aliases)
+    return aliases
+
+
 def common_prefix(values: list[str]) -> str:
     if not values:
         return ""
@@ -581,6 +627,25 @@ def project_for_slot(slot: int) -> Path | None:
             if path.exists() and path.is_dir():
                 return path
     return None
+
+
+def key_for_slot(slot: int) -> str | None:
+    for key, project_slot in load_slots().items():
+        if project_slot == slot:
+            return key
+    return None
+
+
+def remote_parts_from_key(key: str) -> tuple[str, str] | None:
+    if not key.startswith("ssh:"):
+        return None
+    rest = key.removeprefix("ssh:")
+    path_start = rest.find(":/")
+    if path_start == -1:
+        path_start = rest.find(":~")
+    if path_start == -1:
+        return None
+    return rest[:path_start], rest[path_start + 1 :]
 
 
 def reassign_slot(project: Path, slot: int) -> dict[str, int]:
@@ -1119,6 +1184,7 @@ class ThreadCommand:
     remote_host: str | None = None
     remote_path: str | None = None
     remote_port: int | None = None
+    alias: str | None = None
     process: subprocess.Popen[bytes] | None = None
     warm_process: subprocess.Popen[bytes] | None = None
     registered_pgid: int | None = None
@@ -1134,6 +1200,12 @@ class ThreadCommand:
 
     @property
     def name(self) -> str:
+        if self.alias:
+            return self.alias
+        return self.base_name
+
+    @property
+    def base_name(self) -> str:
         if self.is_remote:
             remote_name = Path(str(self.remote_path)).name or str(self.remote_path)
             return f"{self.remote_host}:{remote_name}"
@@ -1285,7 +1357,9 @@ class RunnerUi:
         self.selected = 0
         self.filter_query = ""
         self.show_log = False
+        self.show_details = False
         self.sort_mode = sort_mode if sort_mode in SORT_MODES else "source"
+        self.compact = bool(load_config().get("compact", False))
         self.leader_key = str(load_config().get("leader_key", "space"))
         self.trust_zed_focus = bool(load_config().get("trust_zed_focus", False))
         self.leader_active = False
@@ -1293,6 +1367,7 @@ class RunnerUi:
         self.message = "enter edit | / filter | o sort | t log | c preset | f focus | s run | q quit"
         self.commands = load_commands()
         self.presets = load_presets()
+        self.aliases = load_aliases()
         self.pinned_projects = pinned_projects()
         self.ai_states: dict[str, dict[str, str | float]] = {}
         self.ai_states_checked_at = 0.0
@@ -1337,6 +1412,8 @@ class RunnerUi:
         list_height = max(0, height - 3)
         if self.show_log and height >= 8:
             list_height = max(3, height // 2 - 2)
+        if self.show_details and height >= 8:
+            list_height = max(3, height // 2 - 2)
 
         for row, thread_idx in enumerate(visible_indices[:list_height]):
             thread = self.threads[thread_idx]
@@ -1345,7 +1422,10 @@ class RunnerUi:
             command = display_text(thread.command or "<enter command>")
             status = display_text(thread.last_status)
             slot = format_slot(self.slots.get(thread.key))
-            line = f"{marker} {slot} {token} {thread.name:<22} {status:<12} {command}"
+            if self.compact:
+                line = self.compact_row(marker, slot, token, thread, status, command)
+            else:
+                line = f"{marker} {slot} {token} {thread.name:<22} {status:<12} {command}"
             line = self.with_right_badge(line, ai_badge(ai_states.get(thread.key)), max(1, width - 1))
             attr = self.row_attr(thread, thread_idx == self.selected, focused_project, focused_remote_key, ai_states.get(thread.key))
             self.write_line(stdscr, row + 1, line, attr)
@@ -1355,14 +1435,19 @@ class RunnerUi:
             self.write_line(stdscr, log_start - 1, f"log: {self.current.log_path}", curses.A_REVERSE)
             for offset, line in enumerate(self.tail_log(max(1, height - log_start - 2))):
                 self.write_line(stdscr, log_start + offset, line)
+        elif self.show_details and height >= 8:
+            details_start = list_height + 2
+            self.write_line(stdscr, details_start - 1, f"details: {self.current.name}", curses.A_REVERSE)
+            for offset, line in enumerate(self.thread_details(self.current)[: max(1, height - details_start - 2)]):
+                self.write_line(stdscr, details_start + offset, line)
 
         if height >= 2:
             leader_state = "on" if self.leader_active else "off"
             pending = self.leader_slot_digits or "-"
-            suffix = f" leader={self.leader_key}:{leader_state} slot={pending} filter={self.filter_query or '-'} sort={self.sort_mode}"
+            suffix = f" leader={self.leader_key}:{leader_state} slot={pending} filter={self.filter_query or '-'} sort={self.sort_mode} view={'compact' if self.compact else 'normal'}"
             status_attr = curses.A_REVERSE if self.leader_active else curses.A_DIM
             self.write_line(stdscr, height - 2, f"{self.message} |{suffix}", status_attr)
-            buttons = "[Focus:f] [Run:s] [Stop:x/a] [Hide:h/H] [Pin:b] [Preset:c/P] [Log:t] [AI:A/U/M] [Quit:q/Q]"
+            buttons = "[Focus:f] [Run:s] [Stop:x/a] [Hide:h/H] [Alias:n] [Pin:b] [Info:i] [Preset:c/P] [Log:t] [AI:A/U/M] [Quit:q/Q]"
             self.write_line(stdscr, height - 1, buttons, curses.A_REVERSE)
         stdscr.refresh()
 
@@ -1378,6 +1463,32 @@ class RunnerUi:
             stdscr.addnstr(row, 0, text.ljust(limit), limit, attr)
         except curses.error:
             pass
+
+    def compact_row(self, marker: str, slot: str, token: str, thread: ThreadCommand, status: str, command: str) -> str:
+        name = display_text(thread.name)
+        short_name = name[:14]
+        short_status = self.short_status(status)
+        short_command = command if command != "<enter command>" else "<cmd>"
+        return f"{marker}{slot} {token} {short_name:<14} {short_status:<5} {short_command}"
+
+    def short_status(self, status: str) -> str:
+        if status == "running":
+            return "run"
+        if status == "idle":
+            return "idle"
+        if status == "warming" or status.startswith("nix warmed") or status.startswith("detecting"):
+            return "warm"
+        if status == "stopped":
+            return "stop"
+        if status == "missing command":
+            return "miss"
+        if status.startswith("exited 0"):
+            return "ok"
+        if status.startswith("exited") or status.startswith("warm failed"):
+            return "fail"
+        if status == "no nix shell":
+            return "none"
+        return status[:5] if status else "-"
 
     def init_colors(self) -> None:
         try:
@@ -1535,11 +1646,22 @@ class RunnerUi:
             self.message = "filter cleared"
         elif key == ord("o"):
             self.cycle_sort()
+        elif key == ord("v"):
+            self.toggle_compact()
         elif key == ord("t"):
             self.show_log = not self.show_log
+            if self.show_log:
+                self.show_details = False
             self.message = "log tail shown" if self.show_log else "log tail hidden"
+        elif key == ord("i"):
+            self.show_details = not self.show_details
+            if self.show_details:
+                self.show_log = False
+            self.message = "details shown" if self.show_details else "details hidden"
         elif key == ord("c"):
             self.cycle_preset()
+        elif key == ord("C"):
+            self.pick_command_history(stdscr)
         elif key == ord("P"):
             self.save_preset(stdscr)
         elif key == ord("h"):
@@ -1548,6 +1670,8 @@ class RunnerUi:
             self.unhide_menu(stdscr)
         elif key == ord("p"):
             self.add_project(stdscr)
+        elif key == ord("n"):
+            self.alias_current(stdscr)
         elif key == ord("b"):
             self.toggle_pin_current()
         elif key == ord("s"):
@@ -1720,6 +1844,13 @@ class RunnerUi:
         save_config(config)
         self.message = f"sort: {self.sort_mode}"
 
+    def toggle_compact(self) -> None:
+        self.compact = not self.compact
+        config = load_config()
+        config["compact"] = self.compact
+        save_config(config)
+        self.message = f"view: {'compact' if self.compact else 'normal'}"
+
     def set_filter(self, stdscr: curses.window) -> None:
         self.filter_query = self.read_prompt(stdscr, "filter: ", self.filter_query)
         visible = self.visible_indices(self.cached_focused_project(), self.cached_ai_states())
@@ -1794,9 +1925,18 @@ class RunnerUi:
         project = Path(key).expanduser().resolve()
         if project.exists() and project.is_dir():
             command = load_commands().get(str(project), "")
-            self.threads.append(ThreadCommand(project=project, command=command))
+            self.threads.append(ThreadCommand(project=project, command=command, alias=self.aliases.get(str(project))))
             self.slots = ensure_slot_keys(thread.key for thread in self.threads)
             self.selected = len(self.threads) - 1
+
+    def alias_current(self, stdscr: curses.window) -> None:
+        thread = self.current
+        current_alias = thread.alias or ""
+        prompt = f"alias for {thread.base_name}: "
+        alias = self.read_prompt(stdscr, prompt, current_alias)
+        self.aliases = set_thread_alias(thread.key, alias)
+        thread.alias = self.aliases.get(thread.key)
+        self.message = f"alias cleared: {thread.base_name}" if not thread.alias else f"alias {thread.base_name}: {thread.alias}"
 
     def toggle_pin_current(self) -> None:
         project = self.current.project.expanduser().resolve()
@@ -1822,6 +1962,20 @@ class RunnerUi:
         self.persist_current()
         self.message = f"preset {name}: {self.current.command}"
 
+    def pick_command_history(self, stdscr: curses.window) -> None:
+        history = load_command_history().get(self.current.key, [])
+        if not history:
+            self.message = f"no command history for {self.current.name}"
+            return
+        command = self.choose_entry(stdscr, f"history: {self.current.name}", history)
+        if command is None:
+            self.message = "history cancelled"
+            return
+        self.current.command = command
+        self.persist_current()
+        record_command_history(self.current.key, command)
+        self.message = f"history set {self.current.name}: {command}"
+
     def save_preset(self, stdscr: curses.window) -> None:
         if not self.current.command.strip():
             self.message = "set a command before saving a preset"
@@ -1839,6 +1993,35 @@ class RunnerUi:
         except OSError:
             return ["<no log yet>"]
         return lines[-line_count:] if lines else ["<empty log>"]
+
+    def thread_details(self, thread: ThreadCommand) -> list[str]:
+        aliases = load_aliases()
+        remote_focus = load_remote_focus_targets()
+        remote_nix = load_remote_nix_cache()
+        history_count = len(load_command_history().get(thread.key, []))
+        details = [
+            f"name: {thread.name}",
+            f"base: {thread.base_name}",
+            f"key: {thread.key}",
+            f"alias: {aliases.get(thread.key, '-')}",
+            f"command: {thread.command or '<empty>'}",
+            f"status: {thread.last_status}",
+            f"history: {history_count} command(s)",
+            f"log: {thread.log_path}",
+        ]
+        if thread.is_remote:
+            details.extend(
+                [
+                    f"remote host: {thread.remote_host}",
+                    f"remote path: {thread.remote_path}",
+                    f"remote focus: {remote_focus.get(thread.key, remote_ssh_uri(str(thread.remote_host), str(thread.remote_path)))}",
+                    f"remote nix: {remote_nix.get(thread.key, 'unknown')}",
+                ]
+            )
+        else:
+            details.append(f"project: {thread.project}")
+            details.append(f"nix: {nix_wrapper_kind(thread.project)}")
+        return details
 
     def mark_ai_seen(self, thread: ThreadCommand) -> None:
         state = self.cached_ai_states().get(thread.key)
@@ -2179,6 +2362,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="List hidden projects and exit.",
     )
     parser.add_argument(
+        "--alias-thread",
+        nargs=2,
+        metavar=("KEY", "ALIAS"),
+        help="Set a display alias for a local project path or ssh:host:/path thread key.",
+    )
+    parser.add_argument(
+        "--unalias-thread",
+        metavar="KEY",
+        help="Remove a display alias for a local project path or ssh:host:/path thread key.",
+    )
+    parser.add_argument(
+        "--list-aliases",
+        action="store_true",
+        help="List thread display aliases and exit.",
+    )
+    parser.add_argument(
         "--hide-thread",
         action="append",
         default=[],
@@ -2287,6 +2486,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Initial TUI sort mode.",
     )
     parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Open the TUI in compact row mode and persist that view setting.",
+    )
+    parser.add_argument(
+        "--normal",
+        action="store_true",
+        help="Open the TUI in normal row mode and persist that view setting.",
+    )
+    parser.add_argument(
         "--config-path",
         action="store_true",
         help="Print the runner config path and exit.",
@@ -2308,11 +2517,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def build_threads(projects: list[Path], default_command: str | None) -> list[ThreadCommand]:
     commands = load_commands()
     processes = load_processes()
+    aliases = load_aliases()
     threads: list[ThreadCommand] = []
     for project in projects:
         saved_command = commands.get(str(project), "")
         command = saved_command or default_command or ""
-        thread = ThreadCommand(project=project, command=command)
+        thread = ThreadCommand(project=project, command=command, alias=aliases.get(str(project)))
         process_data = processes.get(str(project))
         if process_data:
             pgid = process_data.get("pgid")
@@ -2332,6 +2542,7 @@ def build_threads(projects: list[Path], default_command: str | None) -> list[Thr
 def build_remote_threads(default_command: str | None) -> list[ThreadCommand]:
     commands = load_commands()
     processes = load_processes()
+    aliases = load_aliases()
     hidden = hidden_thread_keys()
     threads: list[ThreadCommand] = []
     for spec in zed_remote_thread_specs():
@@ -2347,6 +2558,7 @@ def build_remote_threads(default_command: str | None) -> list[ThreadCommand]:
             remote_host=host,
             remote_path=remote_path,
             remote_port=int(spec["port"]) if spec.get("port") else None,
+            alias=aliases.get(key),
         )
         process_data = processes.get(key)
         if process_data:
@@ -2368,6 +2580,29 @@ def thread_for_project(project: Path, default_command: str | None) -> ThreadComm
     return build_threads([project.expanduser().resolve()], default_command)[0]
 
 
+def thread_for_key(key: str, default_command: str | None) -> ThreadCommand | None:
+    if key.startswith("ssh:"):
+        for thread in build_remote_threads(default_command):
+            if thread.key == key:
+                return thread
+        parts = remote_parts_from_key(key)
+        if parts is None:
+            return None
+        host, remote_path = parts
+        command = load_commands().get(key, "") or default_command or ""
+        return ThreadCommand(
+            project=Path(remote_path),
+            command=command,
+            remote_host=host,
+            remote_path=remote_path,
+            alias=load_aliases().get(key),
+        )
+    project = Path(key).expanduser().resolve()
+    if not project.exists() or not project.is_dir():
+        return None
+    return thread_for_project(project, default_command)
+
+
 def run_project(project: Path, command: str | None, focus_zed: bool, stop_all_first: bool, focus_limit: int) -> int:
     project = project.expanduser().resolve()
     if stop_all_first:
@@ -2385,44 +2620,72 @@ def run_project(project: Path, command: str | None, focus_zed: bool, stop_all_fi
 
 
 def run_slot(slot: int, command: str | None, focus_zed: bool, stop_all_first: bool, focus_limit: int) -> int:
-    project = project_for_slot(slot)
-    if project is None:
+    key = key_for_slot(slot)
+    if key is None:
         print(f"no project assigned to slot {slot}", file=sys.stderr)
         return 1
-    return run_project(project, command, focus_zed=focus_zed, stop_all_first=stop_all_first, focus_limit=focus_limit)
-
-
-def focus_slot(slot: int, focus_limit: int) -> int:
-    project = project_for_slot(slot)
-    if project is None:
-        print(f"no project assigned to slot {slot}", file=sys.stderr)
+    if not key.startswith("ssh:"):
+        return run_project(Path(key), command, focus_zed=focus_zed, stop_all_first=stop_all_first, focus_limit=focus_limit)
+    if stop_all_first:
+        stop_all_registered_processes()
+    thread = thread_for_key(key, command)
+    if thread is None:
+        print(f"no remote thread assigned to slot {slot}", file=sys.stderr)
         return 1
-    message, _ = focus_project_in_zed(project, focus_limit=focus_limit)
-    print(message)
+    if focus_zed:
+        ok, message = focus_remote_in_zed(str(thread.remote_host), str(thread.remote_path))
+        print(message, file=sys.stdout if ok else sys.stderr)
+    thread.start()
+    if thread.process is None:
+        print(thread.last_status, file=sys.stderr)
+        return 1
+    print(f"running {thread.key}: pid {thread.process.pid}")
     return 0
 
 
-def stop_slot(slot: int) -> int:
-    project = project_for_slot(slot)
-    if project is None:
+def focus_slot(slot: int, focus_limit: int) -> int:
+    key = key_for_slot(slot)
+    if key is None:
         print(f"no project assigned to slot {slot}", file=sys.stderr)
         return 1
-    data = load_processes().get(str(project))
+    if not key.startswith("ssh:"):
+        message, _ = focus_project_in_zed(Path(key), focus_limit=focus_limit)
+        print(message)
+        return 0
+    thread = thread_for_key(key, None)
+    if thread is None:
+        print(f"no remote thread assigned to slot {slot}", file=sys.stderr)
+        return 1
+    ok, message = focus_remote_in_zed(str(thread.remote_host), str(thread.remote_path))
+    print(message, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+def stop_slot(slot: int) -> int:
+    key = key_for_slot(slot)
+    if key is None:
+        print(f"no project assigned to slot {slot}", file=sys.stderr)
+        return 1
+    data = load_processes().get(key)
     if not data:
         print(f"no tracked command for slot {slot}")
         return 0
     pgid = data.get("pgid")
     if isinstance(pgid, int):
         stop_process_group(pgid)
-    unregister_process(project)
-    print(f"stopped slot {slot}: {project}")
+    unregister_process_key(key)
+    print(f"stopped slot {slot}: {key}")
     return 0
 
 
 def print_slots(sync_zed: bool) -> None:
-    slots = ensure_slots(default_projects(Path.cwd().resolve(), sync_zed=sync_zed))
-    for project, slot in sorted(slots.items(), key=lambda item: item[1]):
-        print(f"{format_slot(slot)} {project}")
+    projects = default_projects(Path.cwd().resolve(), sync_zed=sync_zed)
+    keys = [str(project) for project in projects]
+    if sync_zed:
+        keys.extend(thread.key for thread in build_remote_threads(None))
+    slots = ensure_slot_keys(keys)
+    for key, slot in sorted(slots.items(), key=lambda item: item[1]):
+        print(f"{format_slot(slot)} {key}")
 
 
 def zed_tasks(repo: Path, slot_count: int = DEFAULT_SLOT_COUNT) -> list[dict[str, object]]:
@@ -2554,6 +2817,11 @@ def main(argv: list[str]) -> int:
         print(config_dir() / "config.json")
         return 0
 
+    if args.compact or args.normal:
+        config = load_config()
+        config["compact"] = bool(args.compact and not args.normal)
+        save_config(config)
+
     if args.install_zed_config:
         install_zed_config(args.slot_count)
         return 0
@@ -2609,6 +2877,24 @@ def main(argv: list[str]) -> int:
     if args.list_hidden:
         for project in sorted(hidden_projects()):
             print(project)
+        return 0
+
+    if args.alias_thread:
+        key, alias = args.alias_thread
+        aliases = set_thread_alias(key, alias)
+        normalized = normalize_thread_key(key)
+        print(f"{normalized}: {aliases[normalized]}")
+        return 0
+
+    if args.unalias_thread:
+        aliases = unset_thread_alias(args.unalias_thread)
+        for key, alias in sorted(aliases.items()):
+            print(f"{key}: {alias}")
+        return 0
+
+    if args.list_aliases:
+        for key, alias in sorted(load_aliases().items()):
+            print(f"{key}: {alias}")
         return 0
 
     if args.hide_thread:

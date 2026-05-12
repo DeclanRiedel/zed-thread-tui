@@ -52,12 +52,15 @@ When the terminal supports color, rows are color-coded by priority: focused, fai
 - `up` / `down`: select thread.
 - `/` / `u`: filter / clear filter.
 - `o`: cycle sort mode.
+- `v`: toggle normal / compact row layout.
 - `enter` / `e`: edit command. In the command prompt, `up` / `down` cycle that thread's command history and `tab` completes from history/presets.
-- `c` / `P`: cycle preset / save current command as preset.
+- `c` / `C` / `P`: cycle preset / pick command history / save current command as preset.
 - `t`: toggle log tail pane.
+- `i`: toggle selected-thread details pane.
 - `f`: focus/open selected project in Zed.
 - `p`: add project path.
 - `h` / `H`: hide selected thread / list hidden threads and unhide one.
+- `n`: set or clear an alias for the selected thread.
 - `b`: pin/unpin selected thread.
 - `A` / `U` / `M`: mark selected AI response seen / unchecked / mark all done seen.
 - `s`: start or rerun selected command.
@@ -77,10 +80,16 @@ When the terminal supports color, rows are color-coded by priority: focused, fai
 nix run . -- --list-zed-projects
 nix run . -- --list-zed-remotes
 nix run . -- --sync-zed-projects
+nix run . -- --compact
+nix run . -- --normal
 nix run . -- --add-project /path/to/project-alpha
 nix run . -- --hide-project /path/to/project-alpha
 nix run . -- --unhide-project /path/to/project-alpha
 nix run . -- --list-hidden
+nix run . -- --alias-thread /path/to/project-alpha api
+nix run . -- --alias-thread 'ssh:devbox:/srv/project' remote-api
+nix run . -- --unalias-thread /path/to/project-alpha
+nix run . -- --list-aliases
 nix run . -- --hide-thread 'ssh:devbox:/srv/project'
 nix run . -- --unhide-thread 'ssh:devbox:/srv/project'
 nix run . -- --list-hidden-threads

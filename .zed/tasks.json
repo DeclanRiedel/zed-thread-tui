@@ -78,5 +78,20 @@
     "allow_concurrent_runs": true,
     "reveal": "no_focus",
     "hide": "on_success"
+  },
+  {
+    "label": "thread runner: sync zed projects",
+    "command": "nix",
+    "args": [
+      "run",
+      "/home/declan/personal/thread-run-script-runner-zed",
+      "--",
+      "--sync-zed-projects"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "no_focus",
+    "hide": "on_success"
   }
 ]

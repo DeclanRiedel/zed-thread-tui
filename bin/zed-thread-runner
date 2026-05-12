@@ -8,6 +8,7 @@ import curses
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -17,6 +18,7 @@ from typing import Iterable
 
 
 APP_NAME = "zed-thread-runner"
+ZED_STATE_DIR = Path.home() / ".local" / "share" / "zed"
 
 
 def state_dir() -> Path:
@@ -163,10 +165,71 @@ def discover_worktrees(cwd: Path) -> list[Path]:
     return paths or [cwd]
 
 
-def default_projects(cwd: Path) -> list[Path]:
+def split_zed_paths(value: str | None) -> list[Path]:
+    if not value:
+        return []
+    value = value.strip()
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list):
+        return [Path(str(path)) for path in parsed if str(path)]
+    if "\n" in value:
+        return [Path(part) for part in value.splitlines() if part]
+    if "\0" in value:
+        return [Path(part) for part in value.split("\0") if part]
+    return [Path(value)]
+
+
+def query_zed_paths(db: Path, query: str) -> list[Path]:
+    if not db.exists():
+        return []
+    paths: list[Path] = []
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    try:
+        for (value,) in connection.execute(query):
+            paths.extend(split_zed_paths(value))
+    except sqlite3.Error:
+        return []
+    finally:
+        connection.close()
+    return paths
+
+
+def zed_thread_projects() -> list[Path]:
+    paths: list[Path] = []
+    paths.extend(
+        query_zed_paths(
+            ZED_STATE_DIR / "db" / "0-stable" / "db.sqlite",
+            "select folder_paths from sidebar_threads where archived = 0 order by updated_at desc",
+        )
+    )
+    paths.extend(
+        query_zed_paths(
+            ZED_STATE_DIR / "threads" / "threads.db",
+            "select folder_paths from threads order by updated_at desc",
+        )
+    )
+    paths.extend(
+        query_zed_paths(
+            ZED_STATE_DIR / "db" / "0-stable" / "db.sqlite",
+            "select paths from workspaces order by timestamp desc limit 50",
+        )
+    )
+    return unique_existing(paths)
+
+
+def default_projects(cwd: Path, sync_zed: bool) -> list[Path]:
     registered = load_projects()
+    zed_projects = zed_thread_projects() if sync_zed else []
     discovered = discover_worktrees(cwd)
-    return unique_existing([*registered, *discovered])
+    return unique_existing([*registered, *zed_projects, *discovered])
 
 
 def unique_existing(paths: Iterable[Path]) -> list[Path]:
@@ -174,7 +237,11 @@ def unique_existing(paths: Iterable[Path]) -> list[Path]:
     result: list[Path] = []
     for path in paths:
         resolved = path.expanduser().resolve()
-        if resolved in seen or not resolved.exists() or not resolved.is_dir():
+        try:
+            is_dir = resolved.exists() and resolved.is_dir()
+        except OSError:
+            is_dir = False
+        if resolved in seen or not is_dir:
             continue
         seen.add(resolved)
         result.append(resolved)
@@ -531,6 +598,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Register positional project arguments before opening the TUI.",
     )
+    parser.add_argument(
+        "--no-zed-sync",
+        action="store_true",
+        help="Do not merge projects found in Zed's local thread/workspace databases.",
+    )
+    parser.add_argument(
+        "--sync-zed-projects",
+        action="store_true",
+        help="Persist projects found in Zed's local thread/workspace databases and exit.",
+    )
+    parser.add_argument(
+        "--list-zed-projects",
+        action="store_true",
+        help="List projects found in Zed's local thread/workspace databases and exit.",
+    )
     return parser.parse_args(argv)
 
 
@@ -565,6 +647,17 @@ def main(argv: list[str]) -> int:
             print(project)
         return 0
 
+    if args.list_zed_projects:
+        for project in zed_thread_projects():
+            print(project)
+        return 0
+
+    if args.sync_zed_projects:
+        projects = add_projects(zed_thread_projects())
+        for project in projects:
+            print(project)
+        return 0
+
     if args.stop_all and not args.run_project:
         stopped = stop_all_registered_processes()
         print(f"stopped {stopped} tracked command(s)")
@@ -588,7 +681,7 @@ def main(argv: list[str]) -> int:
     if args.register_args and projects:
         projects = add_projects(projects)
     if not projects:
-        projects = default_projects(cwd)
+        projects = default_projects(cwd, sync_zed=not args.no_zed_sync)
     threads = build_threads(projects, args.command)
     if args.warm:
         for thread in threads:

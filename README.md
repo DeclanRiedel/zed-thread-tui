@@ -41,7 +41,27 @@ If the current directory is a git repository with linked worktrees, the runner a
 
 ## Project Registry
 
-The runner cannot read Zed's private list of open Agent threads or open workspaces. It keeps its own persistent project registry and merges that with git worktree discovery.
+The runner reads Zed's local SQLite state read-only and merges discovered Agent thread/workspace paths with its own persistent project registry and git worktree discovery.
+
+This uses Zed internal storage, not a documented public API, so it may need adjustment if Zed changes its database schema. If that happens, the registry commands below remain the stable fallback.
+
+List projects found from Zed's local thread/workspace state:
+
+```sh
+nix run . -- --list-zed-projects
+```
+
+Persist those Zed projects into the runner registry:
+
+```sh
+nix run . -- --sync-zed-projects
+```
+
+Disable automatic Zed-state merging for one run:
+
+```sh
+nix run . -- --no-zed-sync
+```
 
 Add projects to the runner:
 

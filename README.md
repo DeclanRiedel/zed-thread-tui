@@ -39,10 +39,41 @@ nix run . -- /path/to/project-a /path/to/project-b
 
 If the current directory is a git repository with linked worktrees, the runner auto-discovers those worktrees when no paths are passed.
 
+## Project Registry
+
+The runner cannot read Zed's private list of open Agent threads or open workspaces. It keeps its own persistent project registry and merges that with git worktree discovery.
+
+Add projects to the runner:
+
+```sh
+nix run . -- --add-project /path/to/project-a --add-project /path/to/project-b
+```
+
+List registered projects:
+
+```sh
+nix run . -- --list-projects
+```
+
+Remove a project:
+
+```sh
+nix run . -- --remove-project /path/to/project-a
+```
+
+Open the TUI with explicit projects and register them:
+
+```sh
+nix run . -- --register-args /path/to/project-a /path/to/project-b
+```
+
+Inside the TUI, press `p` to add another project path as a runner thread.
+
 ## Controls
 
 - `up` / `down`: select a thread.
 - `enter` or `e`: edit the selected thread command.
+- `p`: add a project path to the persistent runner thread list.
 - `s`: start, or stop and rerun, the selected thread command.
 - `r`: stop all tracked thread commands, focus/open the selected project in Zed when enabled, then run the selected thread command.
 - `x`: stop the selected thread command.
@@ -96,6 +127,8 @@ thread runner: current worktree
 ```
 
 For global use across projects, add the same task to `~/.config/zed/tasks.json` and update the script path if this repository moves.
+
+From Zed's task picker, use `thread runner: register current worktree` to add the current Zed worktree/project to the runner's persistent list.
 
 Useful keybindings in `~/.config/zed/keymap.json`:
 

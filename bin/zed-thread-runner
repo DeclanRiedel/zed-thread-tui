@@ -48,10 +48,43 @@ def load_processes() -> dict[str, dict[str, int | str]]:
     return {str(k): v for k, v in data.items() if isinstance(v, dict)}
 
 
+def load_projects() -> list[Path]:
+    path = state_dir() / "projects.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return unique_existing(Path(str(project)) for project in data)
+
+
 def save_commands(commands: dict[str, str]) -> None:
     target = state_dir() / "commands.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(commands, indent=2, sort_keys=True) + "\n")
+
+
+def save_projects(projects: list[Path]) -> None:
+    target = state_dir() / "projects.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps([str(project) for project in projects], indent=2) + "\n")
+
+
+def add_projects(projects: Iterable[Path]) -> list[Path]:
+    current = load_projects()
+    merged = unique_existing([*current, *projects])
+    save_projects(merged)
+    return merged
+
+
+def remove_projects(projects: Iterable[Path]) -> list[Path]:
+    removed = {project.expanduser().resolve() for project in projects}
+    kept = [project for project in load_projects() if project not in removed]
+    save_projects(kept)
+    return kept
 
 
 def save_processes(processes: dict[str, dict[str, int | str]]) -> None:
@@ -128,6 +161,12 @@ def discover_worktrees(cwd: Path) -> list[Path]:
         if line.startswith("worktree "):
             paths.append(Path(line.removeprefix("worktree ")).expanduser().resolve())
     return paths or [cwd]
+
+
+def default_projects(cwd: Path) -> list[Path]:
+    registered = load_projects()
+    discovered = discover_worktrees(cwd)
+    return unique_existing([*registered, *discovered])
 
 
 def unique_existing(paths: Iterable[Path]) -> list[Path]:
@@ -286,7 +325,7 @@ class RunnerUi:
         self.threads = threads
         self.focus_zed_on_run = focus_zed_on_run
         self.selected = 0
-        self.message = "enter/e edit | s start/rerun | r stop-all+run | x stop | a stop all | z focus zed | q quit"
+        self.message = "enter/e edit | p add project | s start/rerun | r stop-all+run | x stop | a stop all | q quit"
         self.commands = load_commands()
 
     def run(self, stdscr: curses.window) -> None:
@@ -325,7 +364,7 @@ class RunnerUi:
 
         if height >= 2:
             self.write_line(stdscr, height - 2, self.message, curses.A_DIM)
-            buttons = "[Start/Rerun:s] [Stop:x] [Stop All:a] [Warm:w/W] [Edit:enter] [Quit:q]"
+            buttons = "[Start/Rerun:s] [Stop:x] [Stop All:a] [Add:p] [Warm:w/W] [Edit:enter] [Quit:q]"
             self.write_line(stdscr, height - 1, buttons, curses.A_REVERSE)
         stdscr.refresh()
 
@@ -348,6 +387,8 @@ class RunnerUi:
             self.selected = min(len(self.threads) - 1, self.selected + 1)
         elif key in (curses.KEY_ENTER, 10, 13, ord("e")):
             self.edit_command(stdscr)
+        elif key == ord("p"):
+            self.add_project(stdscr)
         elif key == ord("s"):
             self.start_current(stop_all_first=False)
         elif key == ord("r"):
@@ -373,21 +414,41 @@ class RunnerUi:
         return self.threads[self.selected]
 
     def edit_command(self, stdscr: curses.window) -> None:
+        command = self.read_prompt(stdscr, f"command for {self.current.name}: ", self.current.command)
+        if command:
+            self.current.command = command
+            self.persist_current()
+            self.message = f"set {self.current.name}: {command}"
+
+    def add_project(self, stdscr: curses.window) -> None:
+        raw_path = self.read_prompt(stdscr, "project path: ", "")
+        if not raw_path:
+            return
+        project = Path(raw_path).expanduser().resolve()
+        if not project.exists() or not project.is_dir():
+            self.message = f"not a directory: {project}"
+            return
+        projects = add_projects([project])
+        if all(thread.project != project for thread in self.threads):
+            command = load_commands().get(str(project), "")
+            self.threads.append(ThreadCommand(project=project, command=command))
+            self.selected = len(self.threads) - 1
+        self.message = f"registered {project.name} ({len(projects)} total)"
+
+    def read_prompt(self, stdscr: curses.window, prompt: str, initial: str) -> str:
         stdscr.nodelay(False)
         curses.echo()
         curses.curs_set(1)
         height, width = stdscr.getmaxyx()
-        prompt = f"command for {self.current.name}: "
         input_width = max(1, width - 1)
         if len(prompt) >= input_width:
-            prompt = "command: "
+            prompt = "> "
         self.write_line(stdscr, height - 1, "")
         try:
             stdscr.addnstr(height - 1, 0, prompt, input_width)
         except curses.error:
             pass
         stdscr.refresh()
-        initial = self.current.command
         if initial:
             try:
                 stdscr.addnstr(height - 1, len(prompt), initial, max(0, input_width - len(prompt)))
@@ -399,11 +460,7 @@ class RunnerUi:
             curses.noecho()
             curses.curs_set(0)
             stdscr.nodelay(True)
-        command = raw.decode(errors="replace").strip()
-        if command:
-            self.current.command = command
-            self.persist_current()
-            self.message = f"set {self.current.name}: {command}"
+        return raw.decode(errors="replace").strip()
 
     def persist_current(self) -> None:
         self.commands[self.current.key] = self.current.command
@@ -450,6 +507,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Stop all tracked thread commands before --run-project.",
     )
+    parser.add_argument(
+        "--add-project",
+        action="append",
+        default=[],
+        metavar="PROJECT",
+        help="Add PROJECT to the persistent runner thread list. Can be passed more than once.",
+    )
+    parser.add_argument(
+        "--remove-project",
+        action="append",
+        default=[],
+        metavar="PROJECT",
+        help="Remove PROJECT from the persistent runner thread list. Can be passed more than once.",
+    )
+    parser.add_argument(
+        "--list-projects",
+        action="store_true",
+        help="List registered runner projects and exit.",
+    )
+    parser.add_argument(
+        "--register-args",
+        action="store_true",
+        help="Register positional project arguments before opening the TUI.",
+    )
     return parser.parse_args(argv)
 
 
@@ -466,6 +547,23 @@ def build_threads(projects: list[Path], default_command: str | None) -> list[Thr
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     cwd = Path.cwd().resolve()
+
+    if args.add_project:
+        projects = add_projects(Path(project) for project in args.add_project)
+        for project in projects:
+            print(project)
+        return 0
+
+    if args.remove_project:
+        projects = remove_projects(Path(project) for project in args.remove_project)
+        for project in projects:
+            print(project)
+        return 0
+
+    if args.list_projects:
+        for project in load_projects():
+            print(project)
+        return 0
 
     if args.stop_all and not args.run_project:
         stopped = stop_all_registered_processes()
@@ -487,8 +585,10 @@ def main(argv: list[str]) -> int:
         return 0
 
     projects = unique_existing(Path(path) for path in args.projects)
+    if args.register_args and projects:
+        projects = add_projects(projects)
     if not projects:
-        projects = unique_existing(discover_worktrees(cwd))
+        projects = default_projects(cwd)
     threads = build_threads(projects, args.command)
     if args.warm:
         for thread in threads:

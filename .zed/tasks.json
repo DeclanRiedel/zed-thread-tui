@@ -62,5 +62,21 @@
     "allow_concurrent_runs": true,
     "reveal": "no_focus",
     "hide": "on_success"
+  },
+  {
+    "label": "thread runner: register current worktree",
+    "command": "nix",
+    "args": [
+      "run",
+      "/home/declan/personal/thread-run-script-runner-zed",
+      "--",
+      "--add-project",
+      "$ZED_WORKTREE_ROOT"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "no_focus",
+    "hide": "on_success"
   }
 ]

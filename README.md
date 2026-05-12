@@ -1,165 +1,81 @@
-# Zed Thread Run Script Runner
+# Zed Thread TUI
 
-A small terminal UI for quickly starting, stopping, and rerunning per-project commands from Zed worktrees.
-
-Zed currently exposes tasks and terminals as the practical integration point for this workflow. This project therefore launches a thin terminal UI from a Zed task instead of injecting controls directly into Zed's header chrome.
-
-## Quick Start
-
-Run through Nix:
+Terminal UI for starting, stopping, rerunning, and focusing commands across Zed projects/worktrees.
 
 ```sh
 nix run .
 ```
 
-Build the runnable package:
+The TUI merges projects from:
 
-```sh
-nix build .
-./result/bin/zed-thread-runner
+- Zed's local thread/workspace state, read-only.
+- The runner's saved project registry.
+- Git worktrees from the current repo.
+
+Zed state sync uses internal SQLite files, not a public API, so it may need updates if Zed changes its schema.
+
+## Icons
+
+Rows start with status icons before the project name:
+
+- `*`: command running.
+- `~`: nix warm-up running.
+- `.`: idle or clean exit.
+- `!`: stopped, failed, or missing command.
+- `@`: most recently focused/open Zed project, based on Zed state.
+
+Example:
+
+```text
+> *@ RevoSink                  running       npm run dev
+  .  MGN-WMS                   idle          dotnet watch
 ```
-
-Open a dev shell:
-
-```sh
-nix develop
-```
-
-Run against the current directory:
-
-```sh
-./bin/zed-thread-runner
-```
-
-Run against explicit projects/worktrees:
-
-```sh
-nix run . -- /path/to/project-a /path/to/project-b
-```
-
-If the current directory is a git repository with linked worktrees, the runner auto-discovers those worktrees when no paths are passed.
-
-## Project Registry
-
-The runner reads Zed's local SQLite state read-only and merges discovered Agent thread/workspace paths with its own persistent project registry and git worktree discovery.
-
-This uses Zed internal storage, not a documented public API, so it may need adjustment if Zed changes its database schema. If that happens, the registry commands below remain the stable fallback.
-
-List projects found from Zed's local thread/workspace state:
-
-```sh
-nix run . -- --list-zed-projects
-```
-
-Persist those Zed projects into the runner registry:
-
-```sh
-nix run . -- --sync-zed-projects
-```
-
-Disable automatic Zed-state merging for one run:
-
-```sh
-nix run . -- --no-zed-sync
-```
-
-Add projects to the runner:
-
-```sh
-nix run . -- --add-project /path/to/project-a --add-project /path/to/project-b
-```
-
-List registered projects:
-
-```sh
-nix run . -- --list-projects
-```
-
-Remove a project:
-
-```sh
-nix run . -- --remove-project /path/to/project-a
-```
-
-Open the TUI with explicit projects and register them:
-
-```sh
-nix run . -- --register-args /path/to/project-a /path/to/project-b
-```
-
-Inside the TUI, press `p` to add another project path as a runner thread.
 
 ## Controls
 
-Thread rows start with two compact indicator slots:
+- `up` / `down`: select thread.
+- `enter` / `e`: edit command.
+- `f`: focus/open selected project in Zed.
+- `p`: add a project path.
+- `s`: start or rerun selected command.
+- `r`: stop all, focus selected project, run selected command.
+- `x`: stop selected command.
+- `a`: stop all commands.
+- `w` / `W`: warm selected/all nix shells.
+- `l`: show selected log path.
+- `q`: quit and stop commands.
 
-- `*`: command is running.
-- `~`: nix shell warm-up is running.
-- `.`: idle or cleanly exited.
-- `!`: stopped, failed, or missing command.
-- `@`: project appears to be the most recently focused/open Zed project from Zed's local state.
-
-- `up` / `down`: select a thread.
-- `enter` or `e`: edit the selected thread command.
-- `f`: focus/open the selected project in the existing Zed window.
-- `p`: add a project path to the persistent runner thread list.
-- `s`: start, or stop and rerun, the selected thread command.
-- `r`: stop all tracked thread commands, focus/open the selected project in Zed when enabled, then run the selected thread command.
-- `x`: stop the selected thread command.
-- `a`: stop all running thread commands.
-- `z`: alias for `f`.
-- `w`: warm the selected project's nix shell.
-- `W`: warm all detected nix shells.
-- `l`: show the selected thread's log path.
-- `q`: quit after stopping all running commands.
-
-Commands are persisted per project in `$XDG_STATE_HOME/zed-thread-runner/commands.json`, or `~/.local/state/zed-thread-runner/commands.json` when `XDG_STATE_HOME` is unset.
-
-## Nix Behavior
-
-The runner chooses the command wrapper per project:
-
-- `flake.nix`: `nix develop --command bash -lc '<command>'`
-- `shell.nix` or `default.nix`: `nix-shell --run '<command>'`
-- no nix files: `bash -lc '<command>'`
-
-The `w` and `W` controls run a lightweight warm-up command so the project dev shell is evaluated and cached before you run the real command.
-
-## Non-Interactive Commands
-
-Run the saved command for a project without opening the TUI:
+## Commands
 
 ```sh
-nix run . -- --run-project /path/to/project
-```
-
-Stop every tracked command, focus/open that project in the existing Zed window, then run its saved command:
-
-```sh
+nix run . -- --list-zed-projects
+nix run . -- --sync-zed-projects
+nix run . -- --add-project /path/to/project
+nix run . -- --remove-project /path/to/project
+nix run . -- --list-projects
+nix run . -- --stop-all
 nix run . -- --stop-all-first --focus-zed-on-run --run-project /path/to/project
 ```
 
-Stop all tracked commands:
+Build and check:
 
 ```sh
-nix run . -- --stop-all
+nix build .
+nix flake check
+nix develop
 ```
 
-The focus behavior shells out to `zed --existing <project>`. That can open or focus the project/worktree in Zed, but Zed does not currently expose a CLI/API to select an arbitrary existing agent thread by ID or show a custom native indicator on that thread.
+## Zed
 
-## Zed Task
+Tasks are in `.zed/tasks.json`. Useful task names:
 
-This repository includes `.zed/tasks.json` with tasks for launching the runner through `nix run` against the current Zed worktree. In Zed, run `task: spawn`, then choose:
+- `thread runner: current worktree`
+- `thread runner: all git worktrees`
+- `thread runner: stop all then run current worktree`
+- `thread runner: register current worktree`
+- `thread runner: sync zed projects`
 
-```text
-thread runner: current worktree
-```
-
-For global use across projects, add the same task to `~/.config/zed/tasks.json` and update the script path if this repository moves.
-
-From Zed's task picker, use `thread runner: register current worktree` to add the current Zed worktree/project to the runner's persistent list.
-
-Useful keybindings in `~/.config/zed/keymap.json`:
+Useful keybindings:
 
 ```jsonc
 {
@@ -178,4 +94,4 @@ Useful keybindings in `~/.config/zed/keymap.json`:
 }
 ```
 
-When the runner TUI terminal is focused, `alt-z` opens/focuses Zed on the currently selected runner thread/project.
+The focus action uses `zed --existing <project>`. Zed does not currently expose a public CLI/API to select an arbitrary existing Agent thread by ID.

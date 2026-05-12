@@ -40,6 +40,8 @@ Example:
 AI badges are best-effort. They read Zed's local thread database, map rows to projects with `folder_paths`, and store acknowledgement state in `ai-seen.json`.
 Focusing a project after it shows `[AI:done!]` automatically marks that response `[AI:seen]`.
 
+The `@` marker is runner-owned by default. It moves when you focus/run from this TUI, not when Zed updates background workspace or Agent-thread database rows. To opt back into best-effort Zed DB focus polling, set `trust_zed_focus` to `true` in the runner config.
+
 ## Colors
 
 When the terminal supports color, rows are color-coded by priority: focused, failed, running, warming, AI done, pinned, then remote. The ASCII icons remain the source of truth in no-color terminals.

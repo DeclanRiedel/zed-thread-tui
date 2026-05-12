@@ -236,6 +236,22 @@ class RunnerStateTests(unittest.TestCase):
 
         self.assertIsNone(RUNNER.current_zed_remote_key())
 
+    def test_tui_does_not_poll_zed_focus_by_default(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        db_dir = RUNNER.ZED_STATE_DIR / "db" / "0-stable"
+        db_dir.mkdir(parents=True)
+        con = sqlite3.connect(db_dir / "db.sqlite")
+        con.execute("create table workspaces (paths text, remote_connection_id integer, timestamp text, window_id integer)")
+        con.execute("insert into workspaces values (?, ?, ?, ?)", (str(project), None, "2026-05-12 10:00:00", 1))
+        con.commit()
+        con.close()
+        ui = RUNNER.RunnerUi([RUNNER.ThreadCommand(project=project, command="")], False, 4, "source")
+
+        self.assertIsNone(ui.cached_focused_project())
+        ui.trust_zed_focus = True
+        self.assertEqual(ui.cached_focused_project(), project)
+
     def test_registered_process_restores_as_running(self) -> None:
         project = Path(self.tempdir.name) / "project"
         project.mkdir()

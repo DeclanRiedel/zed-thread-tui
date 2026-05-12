@@ -56,6 +56,7 @@ def default_config() -> dict[str, object]:
         "focus_limit": MAX_FOCUSED_WORKTREES,
         "leader_key": "space",
         "sort_mode": "source",
+        "trust_zed_focus": False,
         "hidden_projects": [],
         "hidden_threads": [],
         "pinned_projects": [],
@@ -1110,6 +1111,7 @@ class RunnerUi:
         self.show_log = False
         self.sort_mode = sort_mode if sort_mode in SORT_MODES else "source"
         self.leader_key = str(load_config().get("leader_key", "space"))
+        self.trust_zed_focus = bool(load_config().get("trust_zed_focus", False))
         self.leader_active = False
         self.leader_slot_digits = ""
         self.message = "enter edit | / filter | o sort | t log | c preset | f focus | s run | q quit"
@@ -1287,6 +1289,8 @@ class RunnerUi:
         return f"{run}{focused}{pinned}{wrapper}{active}"
 
     def cached_focused_project(self) -> Path | None:
+        if not self.trust_zed_focus:
+            return self.focused_project
         now = time.monotonic()
         if now - self.focused_project_checked_at >= ZED_STATE_REFRESH_SECONDS:
             focused_project = current_zed_project()
@@ -1297,6 +1301,8 @@ class RunnerUi:
         return self.focused_project
 
     def cached_focused_remote_key(self) -> str | None:
+        if not self.trust_zed_focus:
+            return self.focused_remote_key
         now = time.monotonic()
         if now - self.focused_remote_checked_at >= ZED_STATE_REFRESH_SECONDS:
             focused_remote_key = current_zed_remote_key()

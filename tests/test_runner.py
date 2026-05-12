@@ -127,6 +127,20 @@ class RunnerStateTests(unittest.TestCase):
         states = RUNNER.zed_ai_thread_metadata(now=RUNNER.parse_zed_timestamp("2026-05-12T10:00:10+00:00"))
         self.assertEqual(states[str(project)]["state"], "running")
 
+    def test_focused_done_ai_thread_is_marked_seen(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        state = {
+            "state": "done",
+            "updated_at": "2026-05-12T10:00:00+00:00",
+            "updated_ts": RUNNER.parse_zed_timestamp("2026-05-12T10:00:00+00:00"),
+        }
+
+        self.assertTrue(RUNNER.mark_ai_seen_for_project(project, state))
+        self.assertEqual(RUNNER.load_ai_seen()[str(project)], "2026-05-12T10:00:00+00:00")
+        self.assertEqual(state["state"], "seen")
+        self.assertFalse(RUNNER.mark_ai_seen_for_project(project, state))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,7 @@ Example:
 `N` is shown when the runner knows a live command or warm-up process is running for a project with `flake.nix`, `shell.nix`, or `default.nix`. It is process-based: the runner records the process group it started and refreshes whether that process group is still alive. It does not introspect arbitrary external shells.
 
 AI badges are best-effort. They read Zed's local thread database, map rows to projects with `folder_paths`, and store acknowledgement state in `ai-seen.json`.
+Focusing a project after it shows `[AI:done!]` automatically marks that response `[AI:seen]`.
 
 ## Controls
 

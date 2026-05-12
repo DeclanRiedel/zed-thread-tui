@@ -511,6 +511,22 @@ def ai_badge(ai_state: dict[str, str | float] | None) -> str:
     return "[AI:-]"
 
 
+def mark_ai_seen_for_project(project: Path, ai_state: dict[str, str | float] | None) -> bool:
+    if not ai_state or ai_state.get("state") != "done":
+        return False
+    updated_at = str(ai_state.get("updated_at", ""))
+    if not updated_at:
+        return False
+    key = str(project.expanduser().resolve())
+    seen = load_ai_seen()
+    if seen.get(key) == updated_at:
+        return False
+    seen[key] = updated_at
+    save_ai_seen(seen)
+    ai_state["state"] = "seen"
+    return True
+
+
 def display_text(value: str) -> str:
     return "".join(ch if ch.isprintable() else "?" for ch in value)
 
@@ -791,6 +807,7 @@ class RunnerUi:
         self.write_line(stdscr, 0, title, curses.A_REVERSE)
         focused_project = self.cached_focused_project()
         ai_states = self.cached_ai_states()
+        self.auto_mark_focused_ai_seen(focused_project, ai_states)
 
         visible_indices = self.visible_indices(focused_project, ai_states)
         list_height = max(0, height - 3)
@@ -874,6 +891,16 @@ class RunnerUi:
         left = left[:left_limit]
         gap = max(1, width - len(left) - len(badge) - 1)
         return f"{left}{' ' * gap}{badge}"
+
+    def auto_mark_focused_ai_seen(
+        self,
+        focused_project: Path | None,
+        ai_states: dict[str, dict[str, str | float]],
+    ) -> None:
+        if focused_project is None:
+            return
+        if mark_ai_seen_for_project(focused_project, ai_states.get(str(focused_project))):
+            self.message = f"AI auto-seen: {focused_project.name}"
 
     def handle_key(self, stdscr: curses.window, key: int) -> None:
         if self.is_leader_key(key):
@@ -1109,14 +1136,13 @@ class RunnerUi:
 
     def mark_ai_seen(self, thread: ThreadCommand) -> None:
         state = self.cached_ai_states().get(thread.key)
-        if not state:
+        if mark_ai_seen_for_project(thread.project, state):
+            self.message = f"AI seen: {thread.name}"
+            return
+        if state is None:
             self.message = f"no AI state for {thread.name}"
             return
-        seen = load_ai_seen()
-        seen[thread.key] = str(state.get("updated_at", ""))
-        save_ai_seen(seen)
-        self.ai_states_checked_at = 0.0
-        self.message = f"AI seen: {thread.name}"
+        self.message = f"AI already seen: {thread.name}"
 
     def mark_ai_unseen(self, thread: ThreadCommand) -> None:
         seen = load_ai_seen()
@@ -1171,6 +1197,7 @@ class RunnerUi:
         message, popped = focus_project_in_zed(self.current.project, focus_limit=self.focus_limit)
         self.focused_project = self.current.project
         self.focused_project_checked_at = time.monotonic()
+        self.auto_mark_focused_ai_seen(self.current.project, self.cached_ai_states())
         self.message = message
 
     def start_current(self, stop_all_first: bool) -> None:
@@ -1181,6 +1208,7 @@ class RunnerUi:
             message, popped = focus_project_in_zed(thread.project, focus_limit=self.focus_limit)
             self.focused_project = thread.project
             self.focused_project_checked_at = time.monotonic()
+            self.auto_mark_focused_ai_seen(thread.project, self.cached_ai_states())
             self.message = message
         thread.start()
         self.commands[thread.key] = thread.command

@@ -105,6 +105,21 @@ class RunnerStateTests(unittest.TestCase):
 
         self.assertEqual([ui.threads[index].project for index in ui.visible_indices()], [project_c, project_a, project_b])
 
+    def test_remote_focus_uri_and_key_generation(self) -> None:
+        self.assertEqual(RUNNER.remote_thread_key("devbox", "~/code/project alpha"), "ssh:devbox:~/code/project alpha")
+        self.assertEqual(RUNNER.remote_ssh_uri("devbox", "~/code/project alpha"), "ssh://devbox/~/code/project%20alpha")
+        self.assertEqual(RUNNER.remote_zed_uri("devbox", "/srv/project"), "zed://ssh/devbox/srv/project")
+
+    def test_remote_focus_target_persists_and_builds_commands(self) -> None:
+        RUNNER.save_remote_focus_target("devbox", "/srv/project", "cmd:zed -r {uri}")
+        key = RUNNER.remote_thread_key("devbox", "/srv/project")
+        self.assertEqual(RUNNER.load_remote_focus_targets()[key], "cmd:zed -r {uri}")
+        self.assertEqual(RUNNER.remote_focus_command("devbox", "/srv/project"), ["zed", "-r", "ssh://devbox/srv/project"])
+        self.assertEqual(
+            RUNNER.remote_focus_command("devbox", "/srv/project", "zed://ssh/devbox/srv/project"),
+            ["zed", "zed://ssh/devbox/srv/project"],
+        )
+
     def test_registered_process_restores_as_running(self) -> None:
         project = Path(self.tempdir.name) / "project"
         project.mkdir()

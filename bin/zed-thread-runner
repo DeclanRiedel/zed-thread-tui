@@ -7,6 +7,7 @@ import argparse
 import curses
 import json
 import os
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote
 
 
 APP_NAME = "zed-thread-runner"
@@ -48,6 +50,7 @@ def default_config() -> dict[str, object]:
         "sort_mode": "source",
         "hidden_projects": [],
         "pinned_projects": [],
+        "remote_focus": {},
     }
 
 
@@ -69,6 +72,96 @@ def save_config(config: dict[str, object]) -> None:
     target = config_dir() / "config.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+
+def remote_path_key(path: str) -> str:
+    text = path.strip()
+    if not text:
+        return "/"
+    if text.startswith("~/"):
+        return text
+    if text == "~":
+        return "~"
+    if not text.startswith("/"):
+        return f"/{text}"
+    return text
+
+
+def remote_thread_key(host: str, path: str) -> str:
+    return f"ssh:{host.strip()}:{remote_path_key(path)}"
+
+
+def remote_uri_path(path: str) -> str:
+    normalized = remote_path_key(path)
+    if normalized == "~":
+        normalized = "/~"
+    elif normalized.startswith("~/"):
+        normalized = f"/~/{normalized[2:]}"
+    return quote(normalized, safe="/~._-")
+
+
+def remote_ssh_uri(host: str, path: str) -> str:
+    return f"ssh://{host.strip()}{remote_uri_path(path)}"
+
+
+def remote_zed_uri(host: str, path: str) -> str:
+    return f"zed://ssh/{host.strip()}{remote_uri_path(path)}"
+
+
+def remote_focus_candidates(host: str, path: str) -> list[str]:
+    return [remote_ssh_uri(host, path), remote_zed_uri(host, path)]
+
+
+def load_remote_focus_targets() -> dict[str, str]:
+    raw = load_config().get("remote_focus", {})
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): str(value) for key, value in raw.items()}
+
+
+def save_remote_focus_target(host: str, path: str, target: str) -> dict[str, str]:
+    config = load_config()
+    targets = load_remote_focus_targets()
+    targets[remote_thread_key(host, path)] = target
+    config["remote_focus"] = targets
+    save_config(config)
+    return targets
+
+
+def remote_focus_template_values(host: str, path: str) -> dict[str, str]:
+    normalized_path = remote_path_key(path)
+    return {
+        "host": host.strip(),
+        "path": normalized_path,
+        "uri": remote_ssh_uri(host, normalized_path),
+        "zed_uri": remote_zed_uri(host, normalized_path),
+        "key": remote_thread_key(host, normalized_path),
+        "label": f"{host.strip()}:{normalized_path}",
+    }
+
+
+def remote_focus_command(host: str, path: str, target: str | None = None) -> list[str]:
+    if target is None:
+        target = load_remote_focus_targets().get(remote_thread_key(host, path), remote_ssh_uri(host, path))
+    rendered = target.format(**remote_focus_template_values(host, path))
+    if rendered.startswith("cmd:"):
+        return shlex.split(rendered.removeprefix("cmd:").strip())
+    if rendered.startswith("zed://"):
+        return ["zed", rendered]
+    return ["zed", "-r", rendered]
+
+
+def focus_remote_in_zed(host: str, path: str, target: str | None = None) -> tuple[bool, str]:
+    command = remote_focus_command(host, path, target)
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        return False, "zed CLI not found"
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.strip()
+        suffix = f": {detail}" if detail else ""
+        return False, f"remote focus failed{suffix}"
+    return True, f"focused remote: {host.strip()}:{remote_path_key(path)}"
 
 
 def hidden_projects() -> set[Path]:
@@ -1418,6 +1511,34 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="List pinned projects and exit.",
     )
     parser.add_argument(
+        "--remote-focus-probe",
+        nargs=2,
+        metavar=("HOST", "PATH"),
+        help="Print candidate Zed remote focus targets for HOST and remote PATH.",
+    )
+    parser.add_argument(
+        "--try-remote-focus",
+        action="store_true",
+        help="With --remote-focus-probe, try the first candidate by invoking Zed.",
+    )
+    parser.add_argument(
+        "--set-remote-focus",
+        nargs=3,
+        metavar=("HOST", "PATH", "TARGET"),
+        help="Persist the focus target for a remote project. Use cmd:<command> for custom templates.",
+    )
+    parser.add_argument(
+        "--focus-remote",
+        nargs=2,
+        metavar=("HOST", "PATH"),
+        help="Focus a remote project in Zed using its saved target or the default ssh:// URI.",
+    )
+    parser.add_argument(
+        "--list-remote-focus",
+        action="store_true",
+        help="List saved remote focus targets and exit.",
+    )
+    parser.add_argument(
         "--register-args",
         action="store_true",
         help="Register positional project arguments before opening the TUI.",
@@ -1757,6 +1878,37 @@ def main(argv: list[str]) -> int:
     if args.list_pinned:
         for project in sorted(pinned_projects()):
             print(project)
+        return 0
+
+    if args.remote_focus_probe:
+        host, remote_path = args.remote_focus_probe
+        print(f"key: {remote_thread_key(host, remote_path)}")
+        for candidate in remote_focus_candidates(host, remote_path):
+            command = remote_focus_command(host, remote_path, candidate)
+            print(f"candidate: {candidate}")
+            print(f"command: {shlex.join(command)}")
+        if args.try_remote_focus:
+            ok, message = focus_remote_in_zed(host, remote_path, remote_ssh_uri(host, remote_path))
+            print(message)
+            return 0 if ok else 1
+        return 0
+
+    if args.set_remote_focus:
+        host, remote_path, target = args.set_remote_focus
+        targets = save_remote_focus_target(host, remote_path, target)
+        key = remote_thread_key(host, remote_path)
+        print(f"{key}: {targets[key]}")
+        return 0
+
+    if args.focus_remote:
+        host, remote_path = args.focus_remote
+        ok, message = focus_remote_in_zed(host, remote_path)
+        print(message, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
+    if args.list_remote_focus:
+        for key, target in sorted(load_remote_focus_targets().items()):
+            print(f"{key}: {target}")
         return 0
 
     if args.list_projects:

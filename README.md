@@ -84,7 +84,15 @@ nix run . -- --reassign-slot /path/to/project-alpha 9
 nix run . -- --focus-id 9
 nix run . -- --stop-all-first --focus-zed-on-run --run-id 9
 nix run . -- --stop-id 9
+nix run . -- --remote-focus-probe devbox /srv/project
+nix run . -- --remote-focus-probe devbox /srv/project --try-remote-focus
+nix run . -- --set-remote-focus devbox /srv/project 'ssh://devbox/srv/project'
+nix run . -- --set-remote-focus devbox /srv/project 'cmd:zed -r {uri}'
+nix run . -- --focus-remote devbox /srv/project
+nix run . -- --list-remote-focus
 ```
+
+Remote focus uses Zed's documented SSH URI shape, `ssh://host/path`, by default. If your Zed install needs a different remote target, persist it with `--set-remote-focus`; `cmd:` targets can use `{host}`, `{path}`, `{uri}`, `{zed_uri}`, `{key}`, and `{label}` placeholders.
 
 ## Zed
 

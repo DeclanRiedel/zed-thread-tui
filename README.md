@@ -14,7 +14,7 @@ The TUI merges projects from:
 
 Zed state sync uses internal SQLite files, not a public API, so it may need updates if Zed changes its schema.
 
-The runner caps focused worktrees at 4. Focusing a fifth project pops the oldest focused project from the runner registry/TUI and stops any command it was running.
+The runner keeps all projects in the TUI, but caps its recent Zed focus set at 4 to avoid repeatedly opening/focusing too many heavy worktrees.
 
 ## Icons
 
@@ -57,6 +57,7 @@ nix run . -- --remove-project /path/to/project
 nix run . -- --list-projects
 nix run . -- --stop-all
 nix run . -- --stop-all-first --focus-zed-on-run --run-project /path/to/project
+nix run . -- --focus-limit 4
 ```
 
 Build and check:

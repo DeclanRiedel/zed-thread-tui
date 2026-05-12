@@ -50,7 +50,7 @@ Focusing a project after it shows `[AI:done!]` automatically marks that response
 - `t`: toggle log tail pane.
 - `f`: focus/open selected project in Zed.
 - `p`: add project path.
-- `h`: hide selected project from the default list.
+- `h` / `H`: hide selected thread / list hidden threads and unhide one.
 - `b`: pin/unpin selected thread.
 - `A` / `U` / `M`: mark selected AI response seen / unchecked / mark all done seen.
 - `s`: start or rerun selected command.

@@ -211,6 +211,10 @@ def hidden_thread_keys() -> set[str]:
     return {str(key) for key in raw}
 
 
+def hidden_thread_entries() -> list[str]:
+    return sorted(hidden_thread_keys())
+
+
 def hide_thread_keys(keys: Iterable[str]) -> list[str]:
     config = load_config()
     hidden = hidden_thread_keys()
@@ -1123,7 +1127,7 @@ class RunnerUi:
             suffix = f" leader={self.leader_key}:{leader_state} slot={pending} filter={self.filter_query or '-'} sort={self.sort_mode}"
             status_attr = curses.A_REVERSE if self.leader_active else curses.A_DIM
             self.write_line(stdscr, height - 2, f"{self.message} |{suffix}", status_attr)
-            buttons = "[Focus:f] [Run:s] [Stop:x/a] [Pin:b] [Preset:c/P] [Log:t] [AI:A/U/M] [Quit:q/Q]"
+            buttons = "[Focus:f] [Run:s] [Stop:x/a] [Hide:h/H] [Pin:b] [Preset:c/P] [Log:t] [AI:A/U/M] [Quit:q/Q]"
             self.write_line(stdscr, height - 1, buttons, curses.A_REVERSE)
         stdscr.refresh()
 
@@ -1226,6 +1230,8 @@ class RunnerUi:
             self.save_preset(stdscr)
         elif key == ord("h"):
             self.hide_current()
+        elif key == ord("H"):
+            self.unhide_menu(stdscr)
         elif key == ord("p"):
             self.add_project(stdscr)
         elif key == ord("b"):
@@ -1439,6 +1445,42 @@ class RunnerUi:
         self.selected = min(self.selected, max(0, len(self.threads) - 1))
         self.message = f"hid {removed}"
 
+    def unhide_menu(self, stdscr: curses.window) -> None:
+        entries = hidden_thread_entries()
+        if not entries:
+            self.message = "no hidden threads"
+            return
+        choice = self.choose_entry(stdscr, "unhide thread", entries)
+        if choice is None:
+            self.message = "unhide cancelled"
+            return
+        unhide_thread_keys([choice])
+        if not choice.startswith("ssh:"):
+            try:
+                unhide_projects([Path(choice)])
+            except OSError:
+                pass
+        self.refresh_unhidden_thread(choice)
+        self.message = f"unhid {choice}"
+
+    def refresh_unhidden_thread(self, key: str) -> None:
+        if any(thread.key == key for thread in self.threads):
+            return
+        if key.startswith("ssh:"):
+            for thread in build_remote_threads(None):
+                if thread.key == key:
+                    self.threads.append(thread)
+                    self.slots = ensure_slot_keys(thread.key for thread in self.threads)
+                    self.selected = len(self.threads) - 1
+                    return
+            return
+        project = Path(key).expanduser().resolve()
+        if project.exists() and project.is_dir():
+            command = load_commands().get(str(project), "")
+            self.threads.append(ThreadCommand(project=project, command=command))
+            self.slots = ensure_slot_keys(thread.key for thread in self.threads)
+            self.selected = len(self.threads) - 1
+
     def toggle_pin_current(self) -> None:
         project = self.current.project.expanduser().resolve()
         if project in self.pinned_projects:
@@ -1535,6 +1577,35 @@ class RunnerUi:
             curses.curs_set(0)
             stdscr.nodelay(True)
         return raw.decode(errors="replace").strip()
+
+    def choose_entry(self, stdscr: curses.window, title: str, entries: list[str]) -> str | None:
+        selected = 0
+        stdscr.nodelay(False)
+        try:
+            while True:
+                stdscr.erase()
+                height, width = stdscr.getmaxyx()
+                self.write_line(stdscr, 0, f"{title}: enter select | q cancel", curses.A_REVERSE)
+                list_height = max(0, height - 2)
+                start = max(0, selected - max(0, list_height - 1))
+                for row, entry in enumerate(entries[start : start + list_height]):
+                    index = start + row
+                    marker = ">" if index == selected else " "
+                    line = f"{marker} {index + 1:02d} {entry}"
+                    attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+                    self.write_line(stdscr, row + 1, line[: max(1, width - 1)], attr)
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key in (ord("q"), 27):
+                    return None
+                if key in (curses.KEY_ENTER, 10, 13):
+                    return entries[selected]
+                if key in (curses.KEY_UP, ord("k")):
+                    selected = max(0, selected - 1)
+                elif key in (curses.KEY_DOWN, ord("j")):
+                    selected = min(len(entries) - 1, selected + 1)
+        finally:
+            stdscr.nodelay(True)
 
     def persist_current(self) -> None:
         self.commands[self.current.key] = self.current.command

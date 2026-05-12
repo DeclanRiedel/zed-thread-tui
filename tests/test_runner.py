@@ -102,6 +102,20 @@ class RunnerStateTests(unittest.TestCase):
 
         RUNNER.unhide_thread_keys([remote_key])
         self.assertEqual(RUNNER.hidden_thread_keys(), {str(project)})
+        self.assertEqual(RUNNER.hidden_thread_entries(), [str(project)])
+
+    def test_refresh_unhidden_local_thread_adds_it_back(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        RUNNER.hide_projects([project])
+        ui = RUNNER.RunnerUi([], focus_zed_on_run=False, focus_limit=4, sort_mode="source")
+
+        RUNNER.unhide_thread_keys([str(project)])
+        RUNNER.unhide_projects([project])
+        ui.refresh_unhidden_thread(str(project))
+
+        self.assertEqual(len(ui.threads), 1)
+        self.assertEqual(ui.threads[0].project, project)
 
     def test_pinned_threads_sort_first(self) -> None:
         project_a = Path(self.tempdir.name) / "project-a"

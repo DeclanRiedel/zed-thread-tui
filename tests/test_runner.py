@@ -186,6 +186,56 @@ class RunnerStateTests(unittest.TestCase):
         self.assertIn("nix develop", command[-1])
         self.assertIn("nix-shell", command[-1])
 
+    def test_current_zed_project_ignores_ambiguous_workspace_timestamps(self) -> None:
+        base = Path(self.tempdir.name)
+        project_a = base / "project-a"
+        project_b = base / "project-b"
+        project_a.mkdir()
+        project_b.mkdir()
+        db_dir = RUNNER.ZED_STATE_DIR / "db" / "0-stable"
+        db_dir.mkdir(parents=True)
+        con = sqlite3.connect(db_dir / "db.sqlite")
+        con.execute("create table workspaces (paths text, remote_connection_id integer, timestamp text, window_id integer)")
+        con.execute("insert into workspaces values (?, ?, ?, ?)", (str(project_a), None, "2026-05-12 10:00:00", 1))
+        con.execute("insert into workspaces values (?, ?, ?, ?)", (str(project_b), None, "2026-05-12 10:00:00", 1))
+        con.commit()
+        con.close()
+
+        self.assertIsNone(RUNNER.current_zed_project())
+
+    def test_current_zed_project_returns_unique_latest_workspace(self) -> None:
+        base = Path(self.tempdir.name)
+        project_a = base / "project-a"
+        project_b = base / "project-b"
+        project_a.mkdir()
+        project_b.mkdir()
+        db_dir = RUNNER.ZED_STATE_DIR / "db" / "0-stable"
+        db_dir.mkdir(parents=True)
+        con = sqlite3.connect(db_dir / "db.sqlite")
+        con.execute("create table workspaces (paths text, remote_connection_id integer, timestamp text, window_id integer)")
+        con.execute("insert into workspaces values (?, ?, ?, ?)", (str(project_a), None, "2026-05-12 10:00:00", 1))
+        con.execute("insert into workspaces values (?, ?, ?, ?)", (str(project_b), None, "2026-05-12 10:01:00", 1))
+        con.commit()
+        con.close()
+
+        self.assertEqual(RUNNER.current_zed_project(), project_b)
+
+    def test_current_zed_remote_ignores_ambiguous_local_remote_timestamps(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        db_dir = RUNNER.ZED_STATE_DIR / "db" / "0-stable"
+        db_dir.mkdir(parents=True)
+        con = sqlite3.connect(db_dir / "db.sqlite")
+        con.execute("create table remote_connections (id integer primary key, kind text, host text, port integer, user text)")
+        con.execute("create table workspaces (paths text, remote_connection_id integer, timestamp text, window_id integer)")
+        con.execute("insert into remote_connections values (?, ?, ?, ?, ?)", (1, "ssh", "devbox", None, "declan"))
+        con.execute("insert into workspaces values (?, ?, ?, ?)", (str(project), None, "2026-05-12 10:00:00", 1))
+        con.execute("insert into workspaces values (?, ?, ?, ?)", ("/srv/project", 1, "2026-05-12 10:00:00", 1))
+        con.commit()
+        con.close()
+
+        self.assertIsNone(RUNNER.current_zed_remote_key())
+
     def test_registered_process_restores_as_running(self) -> None:
         project = Path(self.tempdir.name) / "project"
         project.mkdir()

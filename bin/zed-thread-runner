@@ -814,29 +814,77 @@ def zed_remote_thread_specs() -> list[dict[str, str | int | None]]:
 
 
 def current_zed_project() -> Path | None:
-    paths: list[Path] = []
-    paths.extend(
-        query_zed_paths(
-            ZED_STATE_DIR / "db" / "0-stable" / "db.sqlite",
-            "select paths from workspaces where paths is not null and paths != '' order by timestamp desc limit 1",
-        )
-    )
-    paths.extend(
-        query_zed_paths(
-            ZED_STATE_DIR / "db" / "0-stable" / "db.sqlite",
-            "select folder_paths from sidebar_threads where archived = 0 and folder_paths is not null and folder_paths != '' order by updated_at desc limit 1",
-        )
-    )
-    existing = unique_existing(paths)
+    db = ZED_STATE_DIR / "db" / "0-stable" / "db.sqlite"
+    if not db.exists():
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = connection.execute(
+            """
+            select paths, remote_connection_id, timestamp
+            from workspaces
+            where paths is not null and paths != '' and window_id is not null
+            order by timestamp desc
+            limit 20
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    if not rows:
+        return None
+    latest_timestamp = rows[0][2]
+    latest_rows = [row for row in rows if row[2] == latest_timestamp]
+    if len(latest_rows) != 1:
+        return None
+    paths_raw, remote_connection_id, _timestamp = latest_rows[0]
+    if remote_connection_id is not None:
+        return None
+    existing = unique_existing(split_zed_paths(str(paths_raw)))
     return existing[0] if existing else None
 
 
 def current_zed_remote_key() -> str | None:
-    specs = zed_remote_thread_specs()
-    if not specs:
+    db = ZED_STATE_DIR / "db" / "0-stable" / "db.sqlite"
+    if not db.exists():
         return None
-    spec = specs[0]
-    return remote_thread_key(str(spec["host"]), str(spec["path"]))
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = connection.execute(
+            """
+            select w.paths, w.remote_connection_id, rc.host, rc.user, rc.port, w.timestamp
+            from workspaces w
+            left join remote_connections rc on rc.id = w.remote_connection_id
+            where w.paths is not null and w.paths != '' and w.window_id is not null
+            order by w.timestamp desc
+            limit 20
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    if not rows:
+        return None
+    latest_timestamp = rows[0][5]
+    latest_rows = [row for row in rows if row[5] == latest_timestamp]
+    if len(latest_rows) != 1:
+        return None
+    paths_raw, remote_connection_id, host, user, port, _timestamp = latest_rows[0]
+    if remote_connection_id is None or not host:
+        return None
+    ssh_host = remote_host_label(str(user) if user else None, str(host), int(port) if port else None)
+    paths = split_zed_paths(str(paths_raw))
+    if len(paths) != 1:
+        return None
+    return remote_thread_key(ssh_host, str(paths[0]))
 
 
 def default_projects(cwd: Path, sync_zed: bool) -> list[Path]:
@@ -1241,14 +1289,20 @@ class RunnerUi:
     def cached_focused_project(self) -> Path | None:
         now = time.monotonic()
         if now - self.focused_project_checked_at >= ZED_STATE_REFRESH_SECONDS:
-            self.focused_project = current_zed_project()
+            focused_project = current_zed_project()
+            if focused_project is not None:
+                self.focused_project = focused_project
+                self.focused_remote_key = None
             self.focused_project_checked_at = now
         return self.focused_project
 
     def cached_focused_remote_key(self) -> str | None:
         now = time.monotonic()
         if now - self.focused_remote_checked_at >= ZED_STATE_REFRESH_SECONDS:
-            self.focused_remote_key = current_zed_remote_key()
+            focused_remote_key = current_zed_remote_key()
+            if focused_remote_key is not None:
+                self.focused_remote_key = focused_remote_key
+                self.focused_project = None
             self.focused_remote_checked_at = now
         return self.focused_remote_key
 
@@ -1693,11 +1747,13 @@ class RunnerUi:
         if self.current.is_remote:
             ok, message = focus_remote_in_zed(str(self.current.remote_host), str(self.current.remote_path))
             self.focused_remote_key = self.current.key
+            self.focused_project = None
             self.focused_remote_checked_at = time.monotonic()
             self.message = message if ok else f"{message}; runner focused {self.current.name}"
             return
         message, popped = focus_project_in_zed(self.current.project, focus_limit=self.focus_limit)
         self.focused_project = self.current.project
+        self.focused_remote_key = None
         self.focused_project_checked_at = time.monotonic()
         self.auto_mark_focused_ai_seen(self.current.project, self.cached_ai_states())
         self.message = message
@@ -1710,11 +1766,13 @@ class RunnerUi:
             if thread.is_remote:
                 ok, message = focus_remote_in_zed(str(thread.remote_host), str(thread.remote_path))
                 self.focused_remote_key = thread.key
+                self.focused_project = None
                 self.focused_remote_checked_at = time.monotonic()
                 self.message = message if ok else f"{message}; runner focused {thread.name}"
             else:
                 message, popped = focus_project_in_zed(thread.project, focus_limit=self.focus_limit)
                 self.focused_project = thread.project
+                self.focused_remote_key = None
                 self.focused_project_checked_at = time.monotonic()
                 self.auto_mark_focused_ai_seen(thread.project, self.cached_ai_states())
                 self.message = message

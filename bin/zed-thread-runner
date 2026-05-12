@@ -37,10 +37,77 @@ def load_commands() -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items()}
 
 
+def load_processes() -> dict[str, dict[str, int | str]]:
+    path = state_dir() / "processes.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+
+
 def save_commands(commands: dict[str, str]) -> None:
     target = state_dir() / "commands.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(commands, indent=2, sort_keys=True) + "\n")
+
+
+def save_processes(processes: dict[str, dict[str, int | str]]) -> None:
+    target = state_dir() / "processes.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(processes, indent=2, sort_keys=True) + "\n")
+
+
+def register_process(project: Path, process: subprocess.Popen[bytes], command: str) -> None:
+    processes = load_processes()
+    try:
+        pgid = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return
+    processes[str(project)] = {
+        "pid": process.pid,
+        "pgid": pgid,
+        "command": command,
+    }
+    save_processes(processes)
+
+
+def unregister_process(project: Path) -> None:
+    processes = load_processes()
+    if processes.pop(str(project), None) is not None:
+        save_processes(processes)
+
+
+def stop_process_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def stop_all_registered_processes() -> int:
+    processes = load_processes()
+    stopped = 0
+    for data in processes.values():
+        pgid = data.get("pgid")
+        if isinstance(pgid, int):
+            stop_process_group(pgid)
+            stopped += 1
+    save_processes({})
+    return stopped
 
 
 def discover_worktrees(cwd: Path) -> list[Path]:
@@ -97,6 +164,20 @@ def format_pid(process: subprocess.Popen[bytes] | None) -> str:
     return str(process.pid) if process.poll() is None else "-"
 
 
+def focus_project_in_zed(project: Path) -> str:
+    try:
+        subprocess.Popen(
+            ["zed", "--existing", str(project)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        return f"zed focus failed: {error}"
+    return f"focused zed: {project.name}"
+
+
 @dataclass
 class ThreadCommand:
     project: Path
@@ -126,6 +207,7 @@ class ThreadCommand:
                 self.last_exit = exit_code
                 self.last_status = f"exited {exit_code}"
                 self.process = None
+                unregister_process(self.project)
         if self.warm_process is not None:
             exit_code = self.warm_process.poll()
             if exit_code is not None:
@@ -149,6 +231,7 @@ class ThreadCommand:
                 stdin=subprocess.DEVNULL,
                 preexec_fn=os.setsid,
             )
+            register_process(self.project, self.process, self.command)
         self.last_status = "running"
         self.last_exit = None
 
@@ -194,14 +277,16 @@ class ThreadCommand:
                 pass
         self.last_exit = self.process.poll()
         self.process = None
+        unregister_process(self.project)
         self.last_status = "stopped"
 
 
 class RunnerUi:
-    def __init__(self, threads: list[ThreadCommand]) -> None:
+    def __init__(self, threads: list[ThreadCommand], focus_zed_on_run: bool) -> None:
         self.threads = threads
+        self.focus_zed_on_run = focus_zed_on_run
         self.selected = 0
-        self.message = "enter/e edit | s start/rerun | x stop | a stop all | w warm | W warm all | l log | q quit"
+        self.message = "enter/e edit | s start/rerun | r stop-all+run | x stop | a stop all | z focus zed | q quit"
         self.commands = load_commands()
 
     def run(self, stdscr: curses.window) -> None:
@@ -264,8 +349,9 @@ class RunnerUi:
         elif key in (curses.KEY_ENTER, 10, 13, ord("e")):
             self.edit_command(stdscr)
         elif key == ord("s"):
-            self.current.start()
-            self.persist_current()
+            self.start_current(stop_all_first=False)
+        elif key == ord("r"):
+            self.start_current(stop_all_first=True)
         elif key == ord("x"):
             self.current.stop()
         elif key == ord("a"):
@@ -279,6 +365,8 @@ class RunnerUi:
             self.message = "warming all nix shells"
         elif key == ord("l"):
             self.message = f"log: {self.current.log_path}"
+        elif key == ord("z"):
+            self.message = focus_project_in_zed(self.current.project)
 
     @property
     def current(self) -> ThreadCommand:
@@ -319,9 +407,20 @@ class RunnerUi:
         self.commands[self.current.key] = self.current.command
         save_commands(self.commands)
 
+    def start_current(self, stop_all_first: bool) -> None:
+        if stop_all_first:
+            self.stop_all()
+        if self.focus_zed_on_run:
+            self.message = focus_project_in_zed(self.current.project)
+        self.current.start()
+        self.persist_current()
+        prefix = "stopped all, " if stop_all_first else ""
+        self.message = f"{prefix}running {self.current.name}"
+
     def stop_all(self) -> None:
         for thread in self.threads:
             thread.stop()
+        stop_all_registered_processes()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -329,6 +428,26 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("projects", nargs="*", help="Project/worktree directories. Defaults to git worktrees or cwd.")
     parser.add_argument("--command", "-c", help="Initial command for projects without a saved command.")
     parser.add_argument("--warm", action="store_true", help="Warm detected nix shells on startup.")
+    parser.add_argument(
+        "--focus-zed-on-run",
+        action="store_true",
+        help="Run 'zed --existing <project>' before starting a selected thread command.",
+    )
+    parser.add_argument(
+        "--run-project",
+        metavar="PROJECT",
+        help="Run the saved/default command for PROJECT without opening the TUI.",
+    )
+    parser.add_argument(
+        "--stop-all",
+        action="store_true",
+        help="Stop all tracked thread commands and exit unless --run-project is also provided.",
+    )
+    parser.add_argument(
+        "--stop-all-first",
+        action="store_true",
+        help="Stop all tracked thread commands before --run-project.",
+    )
     return parser.parse_args(argv)
 
 
@@ -336,7 +455,8 @@ def build_threads(projects: list[Path], default_command: str | None) -> list[Thr
     commands = load_commands()
     threads: list[ThreadCommand] = []
     for project in projects:
-        command = commands.get(str(project), default_command or "")
+        saved_command = commands.get(str(project), "")
+        command = saved_command or default_command or ""
         threads.append(ThreadCommand(project=project, command=command))
     return threads
 
@@ -344,6 +464,26 @@ def build_threads(projects: list[Path], default_command: str | None) -> list[Thr
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     cwd = Path.cwd().resolve()
+
+    if args.stop_all and not args.run_project:
+        stopped = stop_all_registered_processes()
+        print(f"stopped {stopped} tracked command(s)")
+        return 0
+
+    if args.run_project:
+        project = Path(args.run_project).expanduser().resolve()
+        if args.stop_all_first or args.stop_all:
+            stop_all_registered_processes()
+        thread = build_threads([project], args.command)[0]
+        if args.focus_zed_on_run:
+            print(focus_project_in_zed(project))
+        thread.start()
+        if thread.process is None:
+            print(thread.last_status, file=sys.stderr)
+            return 1
+        print(f"running {project}: pid {thread.process.pid}")
+        return 0
+
     projects = unique_existing(Path(path) for path in args.projects)
     if not projects:
         projects = unique_existing(discover_worktrees(cwd))
@@ -353,7 +493,7 @@ def main(argv: list[str]) -> int:
             thread.warm()
 
     try:
-        curses.wrapper(RunnerUi(threads).run)
+        curses.wrapper(RunnerUi(threads, focus_zed_on_run=args.focus_zed_on_run).run)
     except KeyboardInterrupt:
         for thread in threads:
             thread.stop()

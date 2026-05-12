@@ -373,6 +373,7 @@ class RunnerUi:
         return self.threads[self.selected]
 
     def edit_command(self, stdscr: curses.window) -> None:
+        stdscr.nodelay(False)
         curses.echo()
         curses.curs_set(1)
         height, width = stdscr.getmaxyx()
@@ -397,6 +398,7 @@ class RunnerUi:
         finally:
             curses.noecho()
             curses.curs_set(0)
+            stdscr.nodelay(True)
         command = raw.decode(errors="replace").strip()
         if command:
             self.current.command = command

@@ -159,5 +159,14 @@ Useful keybindings in `~/.config/zed/keymap.json`:
     "alt-2": ["action::Sequence", ["agent::ToggleFocus", "agents_sidebar::ToggleThreadSwitcher"]],
     "alt-r": ["task::Spawn", { "task_name": "thread runner: stop all then run current worktree" }]
   }
+},
+{
+  "context": "Terminal",
+  "bindings": {
+    "alt-r": ["terminal::SendText", "r"],
+    "alt-z": ["terminal::SendText", "z"]
+  }
 }
 ```
+
+When the runner TUI terminal is focused, `alt-z` opens/focuses Zed on the currently selected runner thread/project.

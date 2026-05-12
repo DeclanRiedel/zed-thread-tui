@@ -47,6 +47,10 @@ Example:
 - `x` / `a`: stop selected / stop all.
 - `w` / `W`: warm selected/all nix shells.
 - `q` / `Q`: quit and leave commands running / quit and stop all.
+- `<leader>`: toggle leader mode and change the statusline color.
+- `<leader>9f`: focus slot 9 from inside the TUI.
+- `<leader>9r`: stop all and run slot 9 from inside the TUI.
+- `<leader>9x`: stop slot 9 from inside the TUI.
 
 ## Commands
 
@@ -98,7 +102,9 @@ Useful keybindings:
 }
 ```
 
-After `--install-zed-config --slot-count 9`, you can add generated task bindings for fast slot access:
+Inside the TUI, the slot combo order is number then action, e.g. `<leader>9f`.
+
+After `--install-zed-config --slot-count 9`, you can add generated task bindings for fast slot access from Zed itself:
 
 ```jsonc
 {

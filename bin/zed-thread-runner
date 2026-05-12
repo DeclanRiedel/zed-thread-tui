@@ -646,6 +646,8 @@ class RunnerUi:
         self.show_log = False
         self.sort_mode = sort_mode if sort_mode in SORT_MODES else "source"
         self.leader_key = str(load_config().get("leader_key", "space"))
+        self.leader_active = False
+        self.leader_slot_digits = ""
         self.message = "enter edit | / filter | o sort | t log | c preset | f focus | s run | q quit"
         self.commands = load_commands()
         self.presets = load_presets()
@@ -703,8 +705,11 @@ class RunnerUi:
                 self.write_line(stdscr, log_start + offset, line)
 
         if height >= 2:
-            suffix = f" leader={self.leader_key} filter={self.filter_query or '-'} sort={self.sort_mode}"
-            self.write_line(stdscr, height - 2, f"{self.message} |{suffix}", curses.A_DIM)
+            leader_state = "on" if self.leader_active else "off"
+            pending = self.leader_slot_digits or "-"
+            suffix = f" leader={self.leader_key}:{leader_state} slot={pending} filter={self.filter_query or '-'} sort={self.sort_mode}"
+            status_attr = curses.A_REVERSE if self.leader_active else curses.A_DIM
+            self.write_line(stdscr, height - 2, f"{self.message} |{suffix}", status_attr)
             buttons = "[Focus:f] [Run:s] [All+Run:r] [Stop:x] [StopAll:a] [Preset:c/P] [Log:t] [Quit:q/Q]"
             self.write_line(stdscr, height - 1, buttons, curses.A_REVERSE)
         stdscr.refresh()
@@ -744,6 +749,14 @@ class RunnerUi:
         return self.focused_project
 
     def handle_key(self, stdscr: curses.window, key: int) -> None:
+        if self.is_leader_key(key):
+            self.leader_active = not self.leader_active
+            self.leader_slot_digits = ""
+            self.message = "leader active: use <id>f, <id>r, <id>x" if self.leader_active else "leader off"
+            return
+        if self.leader_active:
+            self.handle_leader_key(key)
+            return
         if key in (curses.KEY_UP, ord("k")):
             self.move_selection(-1)
         elif key in (curses.KEY_DOWN, ord("j")):
@@ -791,6 +804,52 @@ class RunnerUi:
             self.message = f"log: {self.current.log_path}"
         elif key in (ord("f"), ord("z")):
             self.focus_current()
+
+    def is_leader_key(self, key: int) -> bool:
+        if self.leader_key in ("space", "Space", "<space>", "<leader>"):
+            return key == ord(" ")
+        return len(self.leader_key) == 1 and key == ord(self.leader_key)
+
+    def handle_leader_key(self, key: int) -> None:
+        if ord("0") <= key <= ord("9"):
+            self.leader_slot_digits += chr(key)
+            self.message = f"leader slot {self.leader_slot_digits}: f focus | r run | x stop"
+            return
+        if key in (ord("f"), ord("r"), ord("x")):
+            if not self.leader_slot_digits:
+                self.message = "leader needs slot number first, e.g. <leader>9f"
+                return
+            slot = int(self.leader_slot_digits)
+            self.run_leader_slot_action(slot, chr(key))
+            self.leader_active = False
+            self.leader_slot_digits = ""
+            return
+        if key in (27, ord("q")):
+            self.leader_active = False
+            self.leader_slot_digits = ""
+            self.message = "leader off"
+            return
+        self.message = "leader: use digits then f/r/x, or leader again to cancel"
+
+    def run_leader_slot_action(self, slot: int, action: str) -> None:
+        thread = self.thread_for_slot(slot)
+        if thread is None:
+            self.message = f"slot {slot} not found"
+            return
+        self.selected = self.threads.index(thread)
+        if action == "f":
+            self.focus_current()
+        elif action == "r":
+            self.start_current(stop_all_first=True)
+        elif action == "x":
+            thread.stop()
+            self.message = f"stopped slot {slot}: {thread.name}"
+
+    def thread_for_slot(self, slot: int) -> ThreadCommand | None:
+        for thread in self.threads:
+            if self.slots.get(thread.key) == slot:
+                return thread
+        return None
 
     @property
     def current(self) -> ThreadCommand:

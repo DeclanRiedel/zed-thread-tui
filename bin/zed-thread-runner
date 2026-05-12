@@ -21,6 +21,7 @@ APP_NAME = "zed-thread-runner"
 ZED_STATE_DIR = Path.home() / ".local" / "share" / "zed"
 MAX_FOCUSED_WORKTREES = 4
 ZED_STATE_REFRESH_SECONDS = 2.0
+SORT_MODES = ["source", "name", "running", "failed", "focused"]
 
 
 def state_dir() -> Path:
@@ -28,6 +29,66 @@ def state_dir() -> Path:
     if base:
         return Path(base) / APP_NAME
     return Path.home() / ".local" / "state" / APP_NAME
+
+
+def config_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME")
+    if base:
+        return Path(base) / APP_NAME
+    return Path.home() / ".config" / APP_NAME
+
+
+def default_config() -> dict[str, object]:
+    return {
+        "focus_limit": MAX_FOCUSED_WORKTREES,
+        "sort_mode": "source",
+        "hidden_projects": [],
+    }
+
+
+def load_config() -> dict[str, object]:
+    config = default_config()
+    path = config_dir() / "config.json"
+    if not path.exists():
+        return config
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return config
+    if isinstance(data, dict):
+        config.update(data)
+    return config
+
+
+def save_config(config: dict[str, object]) -> None:
+    target = config_dir() / "config.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+
+def hidden_projects() -> set[Path]:
+    raw = load_config().get("hidden_projects", [])
+    if not isinstance(raw, list):
+        return set()
+    return {Path(str(project)).expanduser().resolve() for project in raw}
+
+
+def hide_projects(projects: Iterable[Path]) -> list[Path]:
+    config = load_config()
+    hidden = hidden_projects()
+    hidden.update(project.expanduser().resolve() for project in projects)
+    config["hidden_projects"] = sorted(str(project) for project in hidden)
+    save_config(config)
+    return sorted(hidden)
+
+
+def unhide_projects(projects: Iterable[Path]) -> list[Path]:
+    config = load_config()
+    hidden = hidden_projects()
+    hidden.difference_update(project.expanduser().resolve() for project in projects)
+    config["hidden_projects"] = sorted(str(project) for project in hidden)
+    save_config(config)
+    return sorted(hidden)
 
 
 def load_commands() -> dict[str, str]:
@@ -84,6 +145,37 @@ def save_commands(commands: dict[str, str]) -> None:
     target.write_text(json.dumps(commands, indent=2, sort_keys=True) + "\n")
 
 
+def load_presets() -> dict[str, dict[str, str]]:
+    path = state_dir() / "presets.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    presets: dict[str, dict[str, str]] = {}
+    for project, values in data.items():
+        if isinstance(values, dict):
+            presets[str(project)] = {str(name): str(command) for name, command in values.items()}
+    return presets
+
+
+def save_presets(presets: dict[str, dict[str, str]]) -> None:
+    target = state_dir() / "presets.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(presets, indent=2, sort_keys=True) + "\n")
+
+
+def set_preset(project: Path, name: str, command: str) -> dict[str, str]:
+    presets = load_presets()
+    project_presets = presets.setdefault(str(project.expanduser().resolve()), {})
+    project_presets[name] = command
+    save_presets(presets)
+    return project_presets
+
+
 def save_projects(projects: list[Path]) -> None:
     target = state_dir() / "projects.json"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -137,6 +229,16 @@ def register_process(project: Path, process: subprocess.Popen[bytes], command: s
         "command": command,
     }
     save_processes(processes)
+
+
+def is_pgid_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def unregister_process(project: Path) -> None:
@@ -277,7 +379,8 @@ def default_projects(cwd: Path, sync_zed: bool) -> list[Path]:
     registered = load_projects()
     zed_projects = zed_thread_projects() if sync_zed else []
     discovered = discover_worktrees(cwd)
-    return unique_existing([*registered, *zed_projects, *discovered])
+    hidden = hidden_projects()
+    return [project for project in unique_existing([*registered, *zed_projects, *discovered]) if project not in hidden]
 
 
 def unique_existing(paths: Iterable[Path]) -> list[Path]:
@@ -312,6 +415,14 @@ def warm_command_for_project(project: Path) -> list[str] | None:
     return None
 
 
+def nix_wrapper_kind(project: Path) -> str:
+    if (project / "flake.nix").exists():
+        return "flake"
+    if (project / "shell.nix").exists() or (project / "default.nix").exists():
+        return "shell"
+    return "none"
+
+
 def focus_project_in_zed(project: Path, focus_limit: int = MAX_FOCUSED_WORKTREES) -> tuple[str, list[Path]]:
     popped = record_focused_project(project, limit=focus_limit)
     try:
@@ -336,6 +447,8 @@ class ThreadCommand:
     command: str
     process: subprocess.Popen[bytes] | None = None
     warm_process: subprocess.Popen[bytes] | None = None
+    registered_pgid: int | None = None
+    registered_pid: int | None = None
     last_status: str = "idle"
     last_exit: int | None = None
 
@@ -359,6 +472,14 @@ class ThreadCommand:
                 self.last_exit = exit_code
                 self.last_status = f"exited {exit_code}"
                 self.process = None
+                unregister_process(self.project)
+        elif self.registered_pgid is not None:
+            if is_pgid_alive(self.registered_pgid):
+                self.last_status = "running"
+            else:
+                self.registered_pgid = None
+                self.registered_pid = None
+                self.last_status = "exited ?"
                 unregister_process(self.project)
         if self.warm_process is not None:
             exit_code = self.warm_process.poll()
@@ -409,6 +530,13 @@ class ThreadCommand:
         self.last_status = "warming"
 
     def stop(self) -> None:
+        if self.registered_pgid is not None:
+            stop_process_group(self.registered_pgid)
+            self.registered_pgid = None
+            self.registered_pid = None
+            unregister_process(self.project)
+            self.last_status = "stopped"
+            return
         if self.process is None or self.process.poll() is not None:
             self.process = None
             return
@@ -434,13 +562,17 @@ class ThreadCommand:
 
 
 class RunnerUi:
-    def __init__(self, threads: list[ThreadCommand], focus_zed_on_run: bool, focus_limit: int) -> None:
+    def __init__(self, threads: list[ThreadCommand], focus_zed_on_run: bool, focus_limit: int, sort_mode: str) -> None:
         self.threads = threads
         self.focus_zed_on_run = focus_zed_on_run
         self.focus_limit = focus_limit
         self.selected = 0
-        self.message = "enter/e edit | f focus zed | p add project | s start/rerun | r stop-all+run | x stop | q quit"
+        self.filter_query = ""
+        self.show_log = False
+        self.sort_mode = sort_mode if sort_mode in SORT_MODES else "source"
+        self.message = "enter edit | / filter | o sort | t log | c preset | f focus | s run | q quit"
         self.commands = load_commands()
+        self.presets = load_presets()
         self.focused_project: Path | None = None
         self.focused_project_checked_at = 0.0
 
@@ -457,6 +589,8 @@ class RunnerUi:
                 time.sleep(0.1)
                 continue
             if key in (ord("q"), 27):
+                return
+            if key == ord("Q"):
                 self.stop_all()
                 return
             self.handle_key(stdscr, key)
@@ -470,18 +604,31 @@ class RunnerUi:
         self.write_line(stdscr, 0, title, curses.A_REVERSE)
         focused_project = self.cached_focused_project()
 
-        for idx, thread in enumerate(self.threads[: max(0, height - 3)]):
-            marker = ">" if idx == self.selected else " "
+        visible_indices = self.visible_indices(focused_project)
+        list_height = max(0, height - 3)
+        if self.show_log and height >= 8:
+            list_height = max(3, height // 2 - 2)
+
+        for row, thread_idx in enumerate(visible_indices[:list_height]):
+            thread = self.threads[thread_idx]
+            marker = ">" if thread_idx == self.selected else " "
             token = self.thread_token(thread, focused_project)
             command = thread.command or "<enter command>"
             status = thread.last_status
-            line = f"{marker} {token} {thread.name:<24} {status:<13} {command}"
-            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
-            self.write_line(stdscr, idx + 1, line, attr)
+            line = f"{marker} {token} {thread.name:<24} {status:<12} {command}"
+            attr = curses.A_REVERSE if thread_idx == self.selected else curses.A_NORMAL
+            self.write_line(stdscr, row + 1, line, attr)
+
+        if self.show_log and height >= 8:
+            log_start = list_height + 2
+            self.write_line(stdscr, log_start - 1, f"log: {self.current.log_path}", curses.A_REVERSE)
+            for offset, line in enumerate(self.tail_log(max(1, height - log_start - 2))):
+                self.write_line(stdscr, log_start + offset, line)
 
         if height >= 2:
-            self.write_line(stdscr, height - 2, self.message, curses.A_DIM)
-            buttons = "[Focus:f] [Start/Rerun:s] [Stop:x] [Stop All:a] [Add:p] [Edit:enter] [Quit:q]"
+            suffix = f" filter={self.filter_query or '-'} sort={self.sort_mode}"
+            self.write_line(stdscr, height - 2, f"{self.message} |{suffix}", curses.A_DIM)
+            buttons = "[Focus:f] [Run:s] [All+Run:r] [Stop:x] [StopAll:a] [Preset:c/P] [Log:t] [Quit:q/Q]"
             self.write_line(stdscr, height - 1, buttons, curses.A_REVERSE)
         stdscr.refresh()
 
@@ -508,7 +655,9 @@ class RunnerUi:
         elif thread.last_status in ("stopped", "missing command") or thread.last_status.startswith(("exited", "warm failed")):
             run = "!"
         focused = "@" if focused_project == thread.project else " "
-        return f"{run}{focused}"
+        wrapper = {"flake": "F", "shell": "S", "none": "-"}[nix_wrapper_kind(thread.project)]
+        active = "N" if wrapper != "-" and run in ("*", "~") else " "
+        return f"{run}{focused}{wrapper}{active}"
 
     def cached_focused_project(self) -> Path | None:
         now = time.monotonic()
@@ -519,11 +668,31 @@ class RunnerUi:
 
     def handle_key(self, stdscr: curses.window, key: int) -> None:
         if key in (curses.KEY_UP, ord("k")):
-            self.selected = max(0, self.selected - 1)
+            self.move_selection(-1)
         elif key in (curses.KEY_DOWN, ord("j")):
-            self.selected = min(len(self.threads) - 1, self.selected + 1)
+            self.move_selection(1)
         elif key in (curses.KEY_ENTER, 10, 13, ord("e")):
             self.edit_command(stdscr)
+        elif key == ord("/"):
+            self.set_filter(stdscr)
+        elif key == ord("u"):
+            self.filter_query = ""
+            self.message = "filter cleared"
+        elif key == ord("o"):
+            self.cycle_sort()
+        elif key == ord("t"):
+            self.show_log = not self.show_log
+            self.message = "log tail shown" if self.show_log else "log tail hidden"
+        elif key == ord("c"):
+            self.cycle_preset()
+        elif key == ord("P"):
+            self.save_preset(stdscr)
+        elif key == ord("h"):
+            hide_projects([self.current.project])
+            removed = self.current.name
+            self.threads.pop(self.selected)
+            self.selected = min(self.selected, max(0, len(self.threads) - 1))
+            self.message = f"hid {removed}"
         elif key == ord("p"):
             self.add_project(stdscr)
         elif key == ord("s"):
@@ -550,6 +719,60 @@ class RunnerUi:
     def current(self) -> ThreadCommand:
         return self.threads[self.selected]
 
+    def visible_indices(self, focused_project: Path | None = None) -> list[int]:
+        query = self.filter_query.casefold()
+        indices = [
+            idx
+            for idx, thread in enumerate(self.threads)
+            if not query or query in thread.name.casefold() or query in str(thread.project).casefold()
+        ]
+        if self.sort_mode == "source":
+            return indices
+        if self.sort_mode == "name":
+            return sorted(indices, key=lambda idx: self.threads[idx].name.casefold())
+        if self.sort_mode == "running":
+            return sorted(indices, key=lambda idx: (not self.is_running(self.threads[idx]), self.threads[idx].name.casefold()))
+        if self.sort_mode == "failed":
+            return sorted(indices, key=lambda idx: (not self.is_failed(self.threads[idx]), self.threads[idx].name.casefold()))
+        if self.sort_mode == "focused":
+            return sorted(indices, key=lambda idx: (self.threads[idx].project != focused_project, self.threads[idx].name.casefold()))
+        return indices
+
+    def is_running(self, thread: ThreadCommand) -> bool:
+        return (
+            (thread.process is not None and thread.process.poll() is None)
+            or (thread.registered_pgid is not None and is_pgid_alive(thread.registered_pgid))
+            or (thread.warm_process is not None and thread.warm_process.poll() is None)
+        )
+
+    def is_failed(self, thread: ThreadCommand) -> bool:
+        return thread.last_status == "missing command" or thread.last_status.startswith(("exited", "warm failed"))
+
+    def move_selection(self, delta: int) -> None:
+        visible = self.visible_indices(self.cached_focused_project())
+        if not visible:
+            return
+        if self.selected not in visible:
+            self.selected = visible[0]
+            return
+        pos = visible.index(self.selected)
+        self.selected = visible[max(0, min(len(visible) - 1, pos + delta))]
+
+    def cycle_sort(self) -> None:
+        pos = SORT_MODES.index(self.sort_mode) if self.sort_mode in SORT_MODES else 0
+        self.sort_mode = SORT_MODES[(pos + 1) % len(SORT_MODES)]
+        config = load_config()
+        config["sort_mode"] = self.sort_mode
+        save_config(config)
+        self.message = f"sort: {self.sort_mode}"
+
+    def set_filter(self, stdscr: curses.window) -> None:
+        self.filter_query = self.read_prompt(stdscr, "filter: ", self.filter_query)
+        visible = self.visible_indices(self.cached_focused_project())
+        if visible:
+            self.selected = visible[0]
+        self.message = f"filter: {self.filter_query or '-'}"
+
     def edit_command(self, stdscr: curses.window) -> None:
         command = self.read_prompt(stdscr, f"command for {self.current.name}: ", self.current.command)
         if command:
@@ -571,6 +794,37 @@ class RunnerUi:
             self.threads.append(ThreadCommand(project=project, command=command))
             self.selected = len(self.threads) - 1
         self.message = f"registered {project.name} ({len(projects)} total)"
+
+    def cycle_preset(self) -> None:
+        project_presets = self.presets.get(self.current.key, {})
+        if not project_presets:
+            self.message = f"no presets for {self.current.name}"
+            return
+        names = sorted(project_presets)
+        current_name = next((name for name in names if project_presets[name] == self.current.command), None)
+        next_index = 0 if current_name is None else (names.index(current_name) + 1) % len(names)
+        name = names[next_index]
+        self.current.command = project_presets[name]
+        self.persist_current()
+        self.message = f"preset {name}: {self.current.command}"
+
+    def save_preset(self, stdscr: curses.window) -> None:
+        if not self.current.command.strip():
+            self.message = "set a command before saving a preset"
+            return
+        name = self.read_prompt(stdscr, "preset name: ", "")
+        if not name:
+            return
+        project_presets = set_preset(self.current.project, name, self.current.command)
+        self.presets[self.current.key] = project_presets
+        self.message = f"saved preset {name}"
+
+    def tail_log(self, line_count: int) -> list[str]:
+        try:
+            lines = self.current.log_path.read_text(errors="replace").splitlines()
+        except OSError:
+            return ["<no log yet>"]
+        return lines[-line_count:] if lines else ["<empty log>"]
 
     def read_prompt(self, stdscr: curses.window, prompt: str, initial: str) -> str:
         stdscr.nodelay(False)
@@ -631,6 +885,9 @@ class RunnerUi:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    config = load_config()
+    default_focus_limit = int(config.get("focus_limit", MAX_FOCUSED_WORKTREES))
+    default_sort_mode = str(config.get("sort_mode", "source"))
     parser = argparse.ArgumentParser(description="Run per-worktree commands through nix shells.")
     parser.add_argument("projects", nargs="*", help="Project/worktree directories. Defaults to git worktrees or cwd.")
     parser.add_argument("--command", "-c", help="Initial command for projects without a saved command.")
@@ -643,7 +900,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--focus-limit",
         type=int,
-        default=MAX_FOCUSED_WORKTREES,
+        default=default_focus_limit,
         help="Maximum recent projects tracked as focused/opened through this runner.",
     )
     parser.add_argument(
@@ -681,6 +938,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="List registered runner projects and exit.",
     )
     parser.add_argument(
+        "--hide-project",
+        action="append",
+        default=[],
+        metavar="PROJECT",
+        help="Hide PROJECT from the default TUI list. Can be passed more than once.",
+    )
+    parser.add_argument(
+        "--unhide-project",
+        action="append",
+        default=[],
+        metavar="PROJECT",
+        help="Unhide PROJECT. Can be passed more than once.",
+    )
+    parser.add_argument(
+        "--list-hidden",
+        action="store_true",
+        help="List hidden projects and exit.",
+    )
+    parser.add_argument(
         "--register-args",
         action="store_true",
         help="Register positional project arguments before opening the TUI.",
@@ -700,22 +976,146 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="List projects found in Zed's local thread/workspace databases and exit.",
     )
+    parser.add_argument(
+        "--set-preset",
+        nargs=3,
+        metavar=("PROJECT", "NAME", "COMMAND"),
+        help="Save a named command preset for PROJECT.",
+    )
+    parser.add_argument(
+        "--list-presets",
+        metavar="PROJECT",
+        help="List command presets for PROJECT.",
+    )
+    parser.add_argument(
+        "--sort-mode",
+        choices=SORT_MODES,
+        default=default_sort_mode if default_sort_mode in SORT_MODES else "source",
+        help="Initial TUI sort mode.",
+    )
+    parser.add_argument(
+        "--config-path",
+        action="store_true",
+        help="Print the runner config path and exit.",
+    )
+    parser.add_argument(
+        "--install-zed-config",
+        action="store_true",
+        help="Install this repo's Zed tasks into ~/.config/zed/tasks.json and print keybinding hints.",
+    )
     return parser.parse_args(argv)
 
 
 def build_threads(projects: list[Path], default_command: str | None) -> list[ThreadCommand]:
     commands = load_commands()
+    processes = load_processes()
     threads: list[ThreadCommand] = []
     for project in projects:
         saved_command = commands.get(str(project), "")
         command = saved_command or default_command or ""
-        threads.append(ThreadCommand(project=project, command=command))
+        thread = ThreadCommand(project=project, command=command)
+        process_data = processes.get(str(project))
+        if process_data:
+            pgid = process_data.get("pgid")
+            pid = process_data.get("pid")
+            command = str(process_data.get("command", command))
+            if isinstance(pgid, int) and is_pgid_alive(pgid):
+                thread.registered_pgid = pgid
+                thread.registered_pid = pid if isinstance(pid, int) else None
+                thread.command = command
+                thread.last_status = "running"
+            else:
+                unregister_process(project)
+        threads.append(thread)
     return threads
+
+
+def zed_tasks(repo: Path) -> list[dict[str, object]]:
+    runner_ref = str(repo)
+    return [
+        {
+            "label": "thread runner: current worktree",
+            "command": "nix",
+            "args": ["run", runner_ref, "--", "--focus-zed-on-run", "$ZED_WORKTREE_ROOT"],
+            "cwd": "$ZED_WORKTREE_ROOT",
+            "use_new_terminal": False,
+            "allow_concurrent_runs": True,
+            "reveal": "always",
+            "hide": "never",
+        },
+        {
+            "label": "thread runner: all git worktrees",
+            "command": "nix",
+            "args": ["run", runner_ref, "--", "--focus-zed-on-run"],
+            "cwd": "$ZED_WORKTREE_ROOT",
+            "use_new_terminal": False,
+            "allow_concurrent_runs": True,
+            "reveal": "always",
+            "hide": "never",
+        },
+        {
+            "label": "thread runner: stop all then run current worktree",
+            "command": "nix",
+            "args": [
+                "run",
+                runner_ref,
+                "--",
+                "--stop-all-first",
+                "--focus-zed-on-run",
+                "--run-project",
+                "$ZED_WORKTREE_ROOT",
+            ],
+            "cwd": "$ZED_WORKTREE_ROOT",
+            "use_new_terminal": False,
+            "allow_concurrent_runs": True,
+            "reveal": "no_focus",
+            "hide": "on_success",
+        },
+        {
+            "label": "thread runner: register current worktree",
+            "command": "nix",
+            "args": ["run", runner_ref, "--", "--add-project", "$ZED_WORKTREE_ROOT"],
+            "cwd": "$ZED_WORKTREE_ROOT",
+            "use_new_terminal": False,
+            "allow_concurrent_runs": True,
+            "reveal": "no_focus",
+            "hide": "on_success",
+        },
+        {
+            "label": "thread runner: sync zed projects",
+            "command": "nix",
+            "args": ["run", runner_ref, "--", "--sync-zed-projects"],
+            "cwd": "$ZED_WORKTREE_ROOT",
+            "use_new_terminal": False,
+            "allow_concurrent_runs": True,
+            "reveal": "no_focus",
+            "hide": "on_success",
+        },
+    ]
+
+
+def install_zed_config() -> None:
+    repo = Path.cwd().resolve()
+    if not (repo / "flake.nix").exists():
+        repo = Path(__file__).resolve().parents[1]
+    target = Path.home() / ".config" / "zed" / "tasks.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(zed_tasks(repo), indent=2) + "\n")
+    print(f"installed tasks: {target}")
+    print("keymap: add alt-r/alt-z bindings from README if they are missing")
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     cwd = Path.cwd().resolve()
+
+    if args.config_path:
+        print(config_dir() / "config.json")
+        return 0
+
+    if args.install_zed_config:
+        install_zed_config()
+        return 0
 
     if args.add_project:
         projects = add_projects(Path(project) for project in args.add_project)
@@ -729,9 +1129,37 @@ def main(argv: list[str]) -> int:
             print(project)
         return 0
 
+    if args.hide_project:
+        for project in hide_projects(Path(project) for project in args.hide_project):
+            print(project)
+        return 0
+
+    if args.unhide_project:
+        for project in unhide_projects(Path(project) for project in args.unhide_project):
+            print(project)
+        return 0
+
+    if args.list_hidden:
+        for project in sorted(hidden_projects()):
+            print(project)
+        return 0
+
     if args.list_projects:
         for project in load_projects():
             print(project)
+        return 0
+
+    if args.set_preset:
+        project_raw, name, command = args.set_preset
+        presets = set_preset(Path(project_raw), name, command)
+        for preset_name, preset_command in sorted(presets.items()):
+            print(f"{preset_name}: {preset_command}")
+        return 0
+
+    if args.list_presets:
+        project = str(Path(args.list_presets).expanduser().resolve())
+        for name, command in sorted(load_presets().get(project, {}).items()):
+            print(f"{name}: {command}")
         return 0
 
     if args.list_zed_projects:
@@ -776,7 +1204,14 @@ def main(argv: list[str]) -> int:
             thread.warm()
 
     try:
-        curses.wrapper(RunnerUi(threads, focus_zed_on_run=args.focus_zed_on_run, focus_limit=args.focus_limit).run)
+        curses.wrapper(
+            RunnerUi(
+                threads,
+                focus_zed_on_run=args.focus_zed_on_run,
+                focus_limit=args.focus_limit,
+                sort_mode=args.sort_mode,
+            ).run
+        )
     except KeyboardInterrupt:
         for thread in threads:
             thread.stop()

@@ -71,6 +71,14 @@
             ${pkgs.python3}/bin/python3 -m py_compile ${./bin/zed-thread-runner}
             touch "$out"
           '';
+
+          unit-tests = pkgs.runCommand "zed-thread-runner-unit-tests" { } ''
+            cp -R ${self} source
+            chmod -R u+w source
+            cd source
+            ${pkgs.python3}/bin/python3 -m unittest discover -s tests
+            touch "$out"
+          '';
         }
       );
 

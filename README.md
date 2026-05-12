@@ -1,76 +1,72 @@
 # Zed Thread TUI
 
-Terminal UI for starting, stopping, rerunning, and focusing commands across Zed projects/worktrees.
+Terminal UI for running per-project commands across Zed projects/worktrees.
 
 ```sh
 nix run .
 ```
 
-The TUI merges projects from:
+The TUI keeps its own project list, reads Zed's local thread/workspace state read-only, and can discover git worktrees. Zed state sync uses internal SQLite files, so it may need adjustment if Zed changes its schema.
 
-- Zed's local thread/workspace state, read-only.
-- The runner's saved project registry.
-- Git worktrees from the current repo.
+## Row Icons
 
-Zed state sync uses internal SQLite files, not a public API, so it may need updates if Zed changes its schema.
+Rows start with compact status slots:
 
-The runner keeps all projects in the TUI, but caps its recent Zed focus set at 4 to avoid repeatedly opening/focusing too many heavy worktrees.
-
-## Icons
-
-Rows start with status icons before the project name:
-
-- `*`: command running.
-- `~`: nix warm-up running.
+- `*`: command is running.
+- `~`: nix warm-up is running.
 - `.`: idle or clean exit.
 - `!`: stopped, failed, or missing command.
-- `@`: most recently focused/open Zed project, based on Zed state.
+- `@`: most recently focused/open Zed project from Zed state.
+- `F`: project uses `flake.nix`.
+- `S`: project uses `shell.nix` or `default.nix`.
+- `-`: no nix shell detected.
+- `N`: nix shell is active for that row.
 
 Example:
 
 ```text
-> *@ RevoSink                  running       npm run dev
-  .  MGN-WMS                   idle          dotnet watch
+> *@FN project-alpha             running      npm run dev
+  . S  project-beta              idle         just test
 ```
+
+`N` is shown when the runner knows a live command or warm-up process is running for a project with `flake.nix`, `shell.nix`, or `default.nix`. It is process-based: the runner records the process group it started and refreshes whether that process group is still alive. It does not introspect arbitrary external shells.
 
 ## Controls
 
 - `up` / `down`: select thread.
+- `/` / `u`: filter / clear filter.
+- `o`: cycle sort mode.
 - `enter` / `e`: edit command.
+- `c` / `P`: cycle preset / save current command as preset.
+- `t`: toggle log tail pane.
 - `f`: focus/open selected project in Zed.
-- `p`: add a project path.
+- `p`: add project path.
+- `h`: hide selected project from the default list.
 - `s`: start or rerun selected command.
 - `r`: stop all, focus selected project, run selected command.
-- `x`: stop selected command.
-- `a`: stop all commands.
+- `x` / `a`: stop selected / stop all.
 - `w` / `W`: warm selected/all nix shells.
-- `l`: show selected log path.
-- `q`: quit and stop commands.
+- `q` / `Q`: quit and leave commands running / quit and stop all.
 
 ## Commands
 
 ```sh
 nix run . -- --list-zed-projects
 nix run . -- --sync-zed-projects
-nix run . -- --add-project /path/to/project
-nix run . -- --remove-project /path/to/project
-nix run . -- --list-projects
+nix run . -- --add-project /path/to/project-alpha
+nix run . -- --hide-project /path/to/project-alpha
+nix run . -- --unhide-project /path/to/project-alpha
+nix run . -- --list-hidden
+nix run . -- --set-preset /path/to/project-alpha dev "npm run dev"
+nix run . -- --list-presets /path/to/project-alpha
 nix run . -- --stop-all
-nix run . -- --stop-all-first --focus-zed-on-run --run-project /path/to/project
 nix run . -- --focus-limit 4
-```
-
-Build and check:
-
-```sh
-nix build .
-nix flake check
-nix develop
+nix run . -- --install-zed-config
 ```
 
 ## Zed
 
-Tasks are in `.zed/tasks.json`. Useful task names:
+Useful task names:
 
 - `thread runner: current worktree`
 - `thread runner: all git worktrees`
@@ -92,9 +88,17 @@ Useful keybindings:
   "context": "Terminal",
   "bindings": {
     "alt-r": ["terminal::SendText", "r"],
-    "alt-z": ["terminal::SendText", "z"]
+    "alt-z": ["terminal::SendText", "f"]
   }
 }
 ```
 
-The focus action uses `zed --existing <project>`. Zed does not currently expose a public CLI/API to select an arbitrary existing Agent thread by ID.
+The focus action uses `zed --existing <project>`. Zed does not expose a public CLI/API to select an arbitrary existing Agent thread by ID.
+
+## Development
+
+```sh
+nix flake check
+nix build .
+nix develop
+```

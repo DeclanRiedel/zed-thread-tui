@@ -1,0 +1,30 @@
+[
+  {
+    "label": "thread runner: current worktree",
+    "command": "nix",
+    "args": [
+      "run",
+      "/home/declan/personal/thread-run-script-runner-zed",
+      "--",
+      "$ZED_WORKTREE_ROOT"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always",
+    "hide": "never"
+  },
+  {
+    "label": "thread runner: all git worktrees",
+    "command": "nix",
+    "args": [
+      "run",
+      "/home/declan/personal/thread-run-script-runner-zed"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always",
+    "hide": "never"
+  }
+]

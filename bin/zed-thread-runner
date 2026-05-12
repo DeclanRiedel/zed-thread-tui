@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Thin terminal UI for running per-worktree commands through nix shells."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+
+APP_NAME = "zed-thread-runner"
+
+
+def state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME")
+    if base:
+        return Path(base) / APP_NAME
+    return Path.home() / ".local" / "state" / APP_NAME
+
+
+def load_commands() -> dict[str, str]:
+    path = state_dir() / "commands.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def save_commands(commands: dict[str, str]) -> None:
+    target = state_dir() / "commands.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(commands, indent=2, sort_keys=True) + "\n")
+
+
+def discover_worktrees(cwd: Path) -> list[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=cwd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return [cwd]
+
+    paths: list[Path] = []
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            paths.append(Path(line.removeprefix("worktree ")).expanduser().resolve())
+    return paths or [cwd]
+
+
+def unique_existing(paths: Iterable[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in paths:
+        resolved = path.expanduser().resolve()
+        if resolved in seen or not resolved.exists() or not resolved.is_dir():
+            continue
+        seen.add(resolved)
+        result.append(resolved)
+    return result
+
+
+def command_for_project(project: Path, command: str) -> list[str]:
+    if (project / "flake.nix").exists():
+        return ["nix", "develop", "--command", "bash", "-lc", command]
+    if (project / "shell.nix").exists() or (project / "default.nix").exists():
+        return ["nix-shell", "--run", command]
+    return ["bash", "-lc", command]
+
+
+def warm_command_for_project(project: Path) -> list[str] | None:
+    if (project / "flake.nix").exists():
+        return ["nix", "develop", "--command", "true"]
+    if (project / "shell.nix").exists() or (project / "default.nix").exists():
+        return ["nix-shell", "--run", "true"]
+    return None
+
+
+def format_pid(process: subprocess.Popen[bytes] | None) -> str:
+    if process is None:
+        return "-"
+    return str(process.pid) if process.poll() is None else "-"
+
+
+@dataclass
+class ThreadCommand:
+    project: Path
+    command: str
+    process: subprocess.Popen[bytes] | None = None
+    warm_process: subprocess.Popen[bytes] | None = None
+    last_status: str = "idle"
+    last_exit: int | None = None
+
+    @property
+    def key(self) -> str:
+        return str(self.project)
+
+    @property
+    def name(self) -> str:
+        return self.project.name or str(self.project)
+
+    @property
+    def log_path(self) -> Path:
+        safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in self.key)
+        return state_dir() / "logs" / f"{safe}.log"
+
+    def poll(self) -> None:
+        if self.process is not None:
+            exit_code = self.process.poll()
+            if exit_code is not None:
+                self.last_exit = exit_code
+                self.last_status = f"exited {exit_code}"
+                self.process = None
+        if self.warm_process is not None:
+            exit_code = self.warm_process.poll()
+            if exit_code is not None:
+                self.last_status = "nix warmed" if exit_code == 0 else f"warm failed {exit_code}"
+                self.warm_process = None
+
+    def start(self) -> None:
+        if not self.command.strip():
+            self.last_status = "missing command"
+            return
+        self.stop()
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.log_path.open("ab", buffering=0) as log:
+            header = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.command}\n".encode()
+            log.write(header)
+            self.process = subprocess.Popen(
+                command_for_project(self.project, self.command),
+                cwd=self.project,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                preexec_fn=os.setsid,
+            )
+        self.last_status = "running"
+        self.last_exit = None
+
+    def warm(self) -> None:
+        warm_command = warm_command_for_project(self.project)
+        if warm_command is None:
+            self.last_status = "no nix shell"
+            return
+        if self.warm_process is not None and self.warm_process.poll() is None:
+            self.last_status = "warming"
+            return
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.log_path.open("ab", buffering=0) as log:
+            log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] warming nix shell\n".encode())
+            self.warm_process = subprocess.Popen(
+                warm_command,
+                cwd=self.project,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                preexec_fn=os.setsid,
+            )
+        self.last_status = "warming"
+
+    def stop(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            self.process = None
+            return
+        try:
+            os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            self.process = None
+            return
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                break
+            time.sleep(0.05)
+        if self.process.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.last_exit = self.process.poll()
+        self.process = None
+        self.last_status = "stopped"
+
+
+class RunnerUi:
+    def __init__(self, threads: list[ThreadCommand]) -> None:
+        self.threads = threads
+        self.selected = 0
+        self.message = "enter/e edit | s start/rerun | x stop | a stop all | w warm | W warm all | l log | q quit"
+        self.commands = load_commands()
+
+    def run(self, stdscr: curses.window) -> None:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+        while True:
+            for thread in self.threads:
+                thread.poll()
+            self.draw(stdscr)
+            key = stdscr.getch()
+            if key == -1:
+                time.sleep(0.1)
+                continue
+            if key in (ord("q"), 27):
+                self.stop_all()
+                return
+            self.handle_key(stdscr, key)
+
+    def draw(self, stdscr: curses.window) -> None:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        if height <= 0 or width <= 0:
+            return
+        title = "Zed thread runner"
+        self.write_line(stdscr, 0, title, curses.A_REVERSE)
+
+        for idx, thread in enumerate(self.threads[: max(0, height - 3)]):
+            marker = ">" if idx == self.selected else " "
+            status = thread.last_status
+            pid = format_pid(thread.process)
+            command = thread.command or "<enter command>"
+            line = f"{marker} {thread.name:<24} pid {pid:<7} {status:<14} {command}"
+            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
+            self.write_line(stdscr, idx + 1, line, attr)
+
+        if height >= 2:
+            self.write_line(stdscr, height - 2, self.message, curses.A_DIM)
+            buttons = "[Start/Rerun:s] [Stop:x] [Stop All:a] [Warm:w/W] [Edit:enter] [Quit:q]"
+            self.write_line(stdscr, height - 1, buttons, curses.A_REVERSE)
+        stdscr.refresh()
+
+    def write_line(self, stdscr: curses.window, row: int, text: str, attr: int = curses.A_NORMAL) -> None:
+        height, width = stdscr.getmaxyx()
+        if row < 0 or row >= height or width <= 0:
+            return
+        limit = width - 1 if row == height - 1 else width
+        if limit <= 0:
+            return
+        try:
+            stdscr.addnstr(row, 0, text.ljust(limit), limit, attr)
+        except curses.error:
+            pass
+
+    def handle_key(self, stdscr: curses.window, key: int) -> None:
+        if key in (curses.KEY_UP, ord("k")):
+            self.selected = max(0, self.selected - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.selected = min(len(self.threads) - 1, self.selected + 1)
+        elif key in (curses.KEY_ENTER, 10, 13, ord("e")):
+            self.edit_command(stdscr)
+        elif key == ord("s"):
+            self.current.start()
+            self.persist_current()
+        elif key == ord("x"):
+            self.current.stop()
+        elif key == ord("a"):
+            self.stop_all()
+            self.message = "stopped all running commands"
+        elif key == ord("w"):
+            self.current.warm()
+        elif key == ord("W"):
+            for thread in self.threads:
+                thread.warm()
+            self.message = "warming all nix shells"
+        elif key == ord("l"):
+            self.message = f"log: {self.current.log_path}"
+
+    @property
+    def current(self) -> ThreadCommand:
+        return self.threads[self.selected]
+
+    def edit_command(self, stdscr: curses.window) -> None:
+        curses.echo()
+        curses.curs_set(1)
+        height, width = stdscr.getmaxyx()
+        prompt = f"command for {self.current.name}: "
+        input_width = max(1, width - 1)
+        if len(prompt) >= input_width:
+            prompt = "command: "
+        self.write_line(stdscr, height - 1, "")
+        try:
+            stdscr.addnstr(height - 1, 0, prompt, input_width)
+        except curses.error:
+            pass
+        stdscr.refresh()
+        initial = self.current.command
+        if initial:
+            try:
+                stdscr.addnstr(height - 1, len(prompt), initial, max(0, input_width - len(prompt)))
+            except curses.error:
+                pass
+        try:
+            raw = stdscr.getstr(height - 1, len(prompt), max(1, input_width - len(prompt)))
+        finally:
+            curses.noecho()
+            curses.curs_set(0)
+        command = raw.decode(errors="replace").strip()
+        if command:
+            self.current.command = command
+            self.persist_current()
+            self.message = f"set {self.current.name}: {command}"
+
+    def persist_current(self) -> None:
+        self.commands[self.current.key] = self.current.command
+        save_commands(self.commands)
+
+    def stop_all(self) -> None:
+        for thread in self.threads:
+            thread.stop()
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run per-worktree commands through nix shells.")
+    parser.add_argument("projects", nargs="*", help="Project/worktree directories. Defaults to git worktrees or cwd.")
+    parser.add_argument("--command", "-c", help="Initial command for projects without a saved command.")
+    parser.add_argument("--warm", action="store_true", help="Warm detected nix shells on startup.")
+    return parser.parse_args(argv)
+
+
+def build_threads(projects: list[Path], default_command: str | None) -> list[ThreadCommand]:
+    commands = load_commands()
+    threads: list[ThreadCommand] = []
+    for project in projects:
+        command = commands.get(str(project), default_command or "")
+        threads.append(ThreadCommand(project=project, command=command))
+    return threads
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    cwd = Path.cwd().resolve()
+    projects = unique_existing(Path(path) for path in args.projects)
+    if not projects:
+        projects = unique_existing(discover_worktrees(cwd))
+    threads = build_threads(projects, args.command)
+    if args.warm:
+        for thread in threads:
+            thread.warm()
+
+    try:
+        curses.wrapper(RunnerUi(threads).run)
+    except KeyboardInterrupt:
+        for thread in threads:
+            thread.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

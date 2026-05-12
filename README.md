@@ -20,6 +20,7 @@ Rows start with compact status slots:
 - `^`: pinned thread, sorted before unpinned rows.
 - `F`: project uses `flake.nix`.
 - `S`: project uses `shell.nix` or `default.nix`.
+- `R`: remote SSH project discovered from Zed.
 - `-`: no nix shell detected.
 - `N`: nix shell is active for that row.
 - `[AI:run]`: Zed Agent thread was updated very recently, treated as responding.
@@ -66,6 +67,7 @@ Focusing a project after it shows `[AI:done!]` automatically marks that response
 
 ```sh
 nix run . -- --list-zed-projects
+nix run . -- --list-zed-remotes
 nix run . -- --sync-zed-projects
 nix run . -- --add-project /path/to/project-alpha
 nix run . -- --hide-project /path/to/project-alpha
@@ -93,6 +95,7 @@ nix run . -- --list-remote-focus
 ```
 
 Remote focus uses Zed's documented SSH URI shape, `ssh://host/path`, by default. If your Zed install needs a different remote target, persist it with `--set-remote-focus`; `cmd:` targets can use `{host}`, `{path}`, `{uri}`, `{zed_uri}`, `{key}`, and `{label}` placeholders.
+Remote rows are discovered from Zed's `workspaces` joined to `remote_connections`. Commands on those rows run through `ssh` and perform nix detection on the remote host.
 
 ## Zed
 

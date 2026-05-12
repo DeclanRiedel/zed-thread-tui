@@ -91,6 +91,11 @@ def remote_thread_key(host: str, path: str) -> str:
     return f"ssh:{host.strip()}:{remote_path_key(path)}"
 
 
+def remote_host_label(user: str | None, host: str, port: int | None = None) -> str:
+    label = f"{user}@{host}" if user else host
+    return f"{label}:{port}" if port else label
+
+
 def remote_uri_path(path: str) -> str:
     normalized = remote_path_key(path)
     if normalized == "~":
@@ -138,6 +143,33 @@ def remote_focus_template_values(host: str, path: str) -> dict[str, str]:
         "key": remote_thread_key(host, normalized_path),
         "label": f"{host.strip()}:{normalized_path}",
     }
+
+
+def remote_shell_command(path: str, command: str) -> str:
+    quoted_path = shlex.quote(remote_path_key(path))
+    quoted_command = shlex.quote(command)
+    return (
+        f"cd {quoted_path} && "
+        "if [ -f flake.nix ]; then "
+        f"nix develop --command bash -lc {quoted_command}; "
+        "elif [ -f shell.nix ] || [ -f default.nix ]; then "
+        f"nix-shell --run {quoted_command}; "
+        "else "
+        f"bash -lc {quoted_command}; "
+        "fi"
+    )
+
+
+def remote_command_for_project(host: str, path: str, command: str, port: int | None = None) -> list[str]:
+    ssh_command = ["ssh"]
+    ssh_host = host
+    if port:
+        ssh_command.extend(["-p", str(port)])
+        suffix = f":{port}"
+        if ssh_host.endswith(suffix):
+            ssh_host = ssh_host[: -len(suffix)]
+    ssh_command.extend([ssh_host, remote_shell_command(path, command)])
+    return ssh_command
 
 
 def remote_focus_command(host: str, path: str, target: str | None = None) -> list[str]:
@@ -278,7 +310,11 @@ def load_slots() -> dict[str, int]:
             slot_int = int(slot)
         except (TypeError, ValueError):
             continue
-        if slot_int > 0:
+        if slot_int <= 0:
+            continue
+        if str(project).startswith("ssh:"):
+            slots[str(project)] = slot_int
+        else:
             slots[str(Path(str(project)).expanduser().resolve())] = slot_int
     return slots
 
@@ -315,11 +351,14 @@ def save_slots(slots: dict[str, int]) -> None:
 
 
 def ensure_slots(projects: Iterable[Path]) -> dict[str, int]:
+    return ensure_slot_keys(str(project.expanduser().resolve()) for project in projects)
+
+
+def ensure_slot_keys(keys: Iterable[str]) -> dict[str, int]:
     slots = load_slots()
     used = set(slots.values())
     changed = False
-    for project in projects:
-        key = str(project.expanduser().resolve())
+    for key in keys:
         if key in slots:
             continue
         slot = 1
@@ -336,6 +375,8 @@ def ensure_slots(projects: Iterable[Path]) -> dict[str, int]:
 def project_for_slot(slot: int) -> Path | None:
     for project, project_slot in load_slots().items():
         if project_slot == slot:
+            if project.startswith("ssh:"):
+                return None
             path = Path(project)
             if path.exists() and path.is_dir():
                 return path
@@ -432,12 +473,16 @@ def save_processes(processes: dict[str, dict[str, int | str]]) -> None:
 
 
 def register_process(project: Path, process: subprocess.Popen[bytes], command: str) -> None:
+    register_process_key(str(project), process, command)
+
+
+def register_process_key(key: str, process: subprocess.Popen[bytes], command: str) -> None:
     processes = load_processes()
     try:
         pgid = os.getpgid(process.pid)
     except ProcessLookupError:
         return
-    processes[str(project)] = {
+    processes[key] = {
         "pid": process.pid,
         "pgid": pgid,
         "command": command,
@@ -456,8 +501,12 @@ def is_pgid_alive(pgid: int) -> bool:
 
 
 def unregister_process(project: Path) -> None:
+    unregister_process_key(str(project))
+
+
+def unregister_process_key(key: str) -> None:
     processes = load_processes()
-    if processes.pop(str(project), None) is not None:
+    if processes.pop(key, None) is not None:
         save_processes(processes)
 
 
@@ -673,6 +722,51 @@ def zed_thread_projects() -> list[Path]:
     return unique_existing(paths)
 
 
+def zed_remote_thread_specs() -> list[dict[str, str | int | None]]:
+    db = ZED_STATE_DIR / "db" / "0-stable" / "db.sqlite"
+    if not db.exists():
+        return []
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    try:
+        rows = connection.execute(
+            """
+            select w.paths, rc.host, rc.user, rc.port
+            from workspaces w
+            join remote_connections rc on rc.id = w.remote_connection_id
+            where w.paths is not null and w.paths != '' and rc.kind = 'ssh'
+            order by w.timestamp desc
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        connection.close()
+
+    seen: set[str] = set()
+    specs: list[dict[str, str | int | None]] = []
+    for paths_raw, host, user, port in rows:
+        if not host:
+            continue
+        ssh_host = remote_host_label(str(user) if user else None, str(host), int(port) if port else None)
+        for path in split_zed_paths(str(paths_raw)):
+            remote_path = remote_path_key(str(path))
+            key = remote_thread_key(ssh_host, remote_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            specs.append(
+                {
+                    "host": ssh_host,
+                    "path": remote_path,
+                    "port": int(port) if port else None,
+                }
+            )
+    return specs
+
+
 def current_zed_project() -> Path | None:
     paths: list[Path] = []
     paths.extend(
@@ -689,6 +783,14 @@ def current_zed_project() -> Path | None:
     )
     existing = unique_existing(paths)
     return existing[0] if existing else None
+
+
+def current_zed_remote_key() -> str | None:
+    specs = zed_remote_thread_specs()
+    if not specs:
+        return None
+    spec = specs[0]
+    return remote_thread_key(str(spec["host"]), str(spec["path"]))
 
 
 def default_projects(cwd: Path, sync_zed: bool) -> list[Path]:
@@ -761,6 +863,9 @@ def focus_project_in_zed(project: Path, focus_limit: int = MAX_FOCUSED_WORKTREES
 class ThreadCommand:
     project: Path
     command: str
+    remote_host: str | None = None
+    remote_path: str | None = None
+    remote_port: int | None = None
     process: subprocess.Popen[bytes] | None = None
     warm_process: subprocess.Popen[bytes] | None = None
     registered_pgid: int | None = None
@@ -770,11 +875,20 @@ class ThreadCommand:
 
     @property
     def key(self) -> str:
+        if self.is_remote:
+            return remote_thread_key(str(self.remote_host), str(self.remote_path))
         return str(self.project)
 
     @property
     def name(self) -> str:
+        if self.is_remote:
+            remote_name = Path(str(self.remote_path)).name or str(self.remote_path)
+            return f"{self.remote_host}:{remote_name}"
         return self.project.name or str(self.project)
+
+    @property
+    def is_remote(self) -> bool:
+        return self.remote_host is not None and self.remote_path is not None
 
     @property
     def log_path(self) -> Path:
@@ -788,7 +902,7 @@ class ThreadCommand:
                 self.last_exit = exit_code
                 self.last_status = f"exited {exit_code}"
                 self.process = None
-                unregister_process(self.project)
+                unregister_process_key(self.key)
         elif self.registered_pgid is not None:
             if is_pgid_alive(self.registered_pgid):
                 self.last_status = "running"
@@ -796,7 +910,7 @@ class ThreadCommand:
                 self.registered_pgid = None
                 self.registered_pid = None
                 self.last_status = "exited ?"
-                unregister_process(self.project)
+                unregister_process_key(self.key)
         if self.warm_process is not None:
             exit_code = self.warm_process.poll()
             if exit_code is not None:
@@ -812,19 +926,28 @@ class ThreadCommand:
         with self.log_path.open("ab", buffering=0) as log:
             header = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.command}\n".encode()
             log.write(header)
+            popen_cwd = None if self.is_remote else self.project
             self.process = subprocess.Popen(
-                command_for_project(self.project, self.command),
-                cwd=self.project,
+                self.command_argv(),
+                cwd=popen_cwd,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 preexec_fn=os.setsid,
             )
-            register_process(self.project, self.process, self.command)
+            register_process_key(self.key, self.process, self.command)
         self.last_status = "running"
         self.last_exit = None
 
+    def command_argv(self) -> list[str]:
+        if self.is_remote:
+            return remote_command_for_project(str(self.remote_host), str(self.remote_path), self.command, self.remote_port)
+        return command_for_project(self.project, self.command)
+
     def warm(self) -> None:
+        if self.is_remote:
+            self.last_status = "remote warm skipped"
+            return
         warm_command = warm_command_for_project(self.project)
         if warm_command is None:
             self.last_status = "no nix shell"
@@ -850,7 +973,7 @@ class ThreadCommand:
             stop_process_group(self.registered_pgid)
             self.registered_pgid = None
             self.registered_pid = None
-            unregister_process(self.project)
+            unregister_process_key(self.key)
             self.last_status = "stopped"
             return
         if self.process is None or self.process.poll() is not None:
@@ -873,14 +996,14 @@ class ThreadCommand:
                 pass
         self.last_exit = self.process.poll()
         self.process = None
-        unregister_process(self.project)
+        unregister_process_key(self.key)
         self.last_status = "stopped"
 
 
 class RunnerUi:
     def __init__(self, threads: list[ThreadCommand], focus_zed_on_run: bool, focus_limit: int, sort_mode: str) -> None:
         self.threads = threads
-        self.slots = ensure_slots(thread.project for thread in threads)
+        self.slots = ensure_slot_keys(thread.key for thread in threads)
         self.focus_zed_on_run = focus_zed_on_run
         self.focus_limit = focus_limit
         self.selected = 0
@@ -898,6 +1021,8 @@ class RunnerUi:
         self.ai_states_checked_at = 0.0
         self.focused_project: Path | None = None
         self.focused_project_checked_at = 0.0
+        self.focused_remote_key: str | None = None
+        self.focused_remote_checked_at = 0.0
 
     def run(self, stdscr: curses.window) -> None:
         curses.curs_set(0)
@@ -926,6 +1051,7 @@ class RunnerUi:
         title = "Zed thread runner"
         self.write_line(stdscr, 0, title, curses.A_REVERSE)
         focused_project = self.cached_focused_project()
+        focused_remote_key = self.cached_focused_remote_key()
         ai_states = self.cached_ai_states()
         self.auto_mark_focused_ai_seen(focused_project, ai_states)
 
@@ -937,7 +1063,7 @@ class RunnerUi:
         for row, thread_idx in enumerate(visible_indices[:list_height]):
             thread = self.threads[thread_idx]
             marker = ">" if thread_idx == self.selected else " "
-            token = self.thread_token(thread, focused_project)
+            token = self.thread_token(thread, focused_project, focused_remote_key)
             command = display_text(thread.command or "<enter command>")
             status = display_text(thread.last_status)
             slot = format_slot(self.slots.get(thread.key))
@@ -975,7 +1101,7 @@ class RunnerUi:
         except curses.error:
             pass
 
-    def thread_token(self, thread: ThreadCommand, focused_project: Path | None) -> str:
+    def thread_token(self, thread: ThreadCommand, focused_project: Path | None, focused_remote_key: str | None = None) -> str:
         run = "*"
         if thread.warm_process is not None and thread.warm_process.poll() is None:
             run = "~"
@@ -985,9 +1111,9 @@ class RunnerUi:
             run = "."
         elif thread.last_status in ("stopped", "missing command") or thread.last_status.startswith(("exited", "warm failed")):
             run = "!"
-        focused = "@" if focused_project == thread.project else " "
+        focused = "@" if (focused_project == thread.project or focused_remote_key == thread.key) else " "
         pinned = "^" if self.is_pinned(thread) else " "
-        wrapper = {"flake": "F", "shell": "S", "none": "-"}[nix_wrapper_kind(thread.project)]
+        wrapper = "R" if thread.is_remote else {"flake": "F", "shell": "S", "none": "-"}[nix_wrapper_kind(thread.project)]
         active = "N" if wrapper != "-" and run in ("*", "~") else " "
         return f"{run}{focused}{pinned}{wrapper}{active}"
 
@@ -997,6 +1123,13 @@ class RunnerUi:
             self.focused_project = current_zed_project()
             self.focused_project_checked_at = now
         return self.focused_project
+
+    def cached_focused_remote_key(self) -> str | None:
+        now = time.monotonic()
+        if now - self.focused_remote_checked_at >= ZED_STATE_REFRESH_SECONDS:
+            self.focused_remote_key = current_zed_remote_key()
+            self.focused_remote_checked_at = now
+        return self.focused_remote_key
 
     def cached_ai_states(self) -> dict[str, dict[str, str | float]]:
         now = time.monotonic()
@@ -1256,7 +1389,7 @@ class RunnerUi:
         if all(thread.project != project for thread in self.threads):
             command = load_commands().get(str(project), "")
             self.threads.append(ThreadCommand(project=project, command=command))
-            self.slots = ensure_slots(thread.project for thread in self.threads)
+            self.slots = ensure_slot_keys(thread.key for thread in self.threads)
             self.selected = len(self.threads) - 1
         self.message = f"registered {project.name} ({len(projects)} total)"
 
@@ -1362,6 +1495,12 @@ class RunnerUi:
         save_commands(self.commands)
 
     def focus_current(self) -> None:
+        if self.current.is_remote:
+            ok, message = focus_remote_in_zed(str(self.current.remote_host), str(self.current.remote_path))
+            self.focused_remote_key = self.current.key
+            self.focused_remote_checked_at = time.monotonic()
+            self.message = message if ok else f"{message}; runner focused {self.current.name}"
+            return
         message, popped = focus_project_in_zed(self.current.project, focus_limit=self.focus_limit)
         self.focused_project = self.current.project
         self.focused_project_checked_at = time.monotonic()
@@ -1373,11 +1512,17 @@ class RunnerUi:
         if stop_all_first:
             self.stop_all()
         if self.focus_zed_on_run:
-            message, popped = focus_project_in_zed(thread.project, focus_limit=self.focus_limit)
-            self.focused_project = thread.project
-            self.focused_project_checked_at = time.monotonic()
-            self.auto_mark_focused_ai_seen(thread.project, self.cached_ai_states())
-            self.message = message
+            if thread.is_remote:
+                ok, message = focus_remote_in_zed(str(thread.remote_host), str(thread.remote_path))
+                self.focused_remote_key = thread.key
+                self.focused_remote_checked_at = time.monotonic()
+                self.message = message if ok else f"{message}; runner focused {thread.name}"
+            else:
+                message, popped = focus_project_in_zed(thread.project, focus_limit=self.focus_limit)
+                self.focused_project = thread.project
+                self.focused_project_checked_at = time.monotonic()
+                self.auto_mark_focused_ai_seen(thread.project, self.cached_ai_states())
+                self.message = message
         thread.start()
         self.commands[thread.key] = thread.command
         save_commands(self.commands)
@@ -1559,6 +1704,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="List projects found in Zed's local thread/workspace databases and exit.",
     )
     parser.add_argument(
+        "--list-zed-remotes",
+        action="store_true",
+        help="List remote SSH projects found in Zed's workspace database and exit.",
+    )
+    parser.add_argument(
         "--set-preset",
         nargs=3,
         metavar=("PROJECT", "NAME", "COMMAND"),
@@ -1614,6 +1764,38 @@ def build_threads(projects: list[Path], default_command: str | None) -> list[Thr
                 thread.last_status = "running"
             else:
                 unregister_process(project)
+        threads.append(thread)
+    return threads
+
+
+def build_remote_threads(default_command: str | None) -> list[ThreadCommand]:
+    commands = load_commands()
+    processes = load_processes()
+    threads: list[ThreadCommand] = []
+    for spec in zed_remote_thread_specs():
+        host = str(spec["host"])
+        remote_path = str(spec["path"])
+        key = remote_thread_key(host, remote_path)
+        command = commands.get(key, "") or default_command or ""
+        thread = ThreadCommand(
+            project=Path(remote_path),
+            command=command,
+            remote_host=host,
+            remote_path=remote_path,
+            remote_port=int(spec["port"]) if spec.get("port") else None,
+        )
+        process_data = processes.get(key)
+        if process_data:
+            pgid = process_data.get("pgid")
+            pid = process_data.get("pid")
+            command = str(process_data.get("command", command))
+            if isinstance(pgid, int) and is_pgid_alive(pgid):
+                thread.registered_pgid = pgid
+                thread.registered_pid = pid if isinstance(pid, int) else None
+                thread.command = command
+                thread.last_status = "running"
+            else:
+                unregister_process_key(key)
         threads.append(thread)
     return threads
 
@@ -1934,6 +2116,11 @@ def main(argv: list[str]) -> int:
             print(project)
         return 0
 
+    if args.list_zed_remotes:
+        for spec in zed_remote_thread_specs():
+            print(f"{spec['host']}:{spec['path']}")
+        return 0
+
     if args.sync_zed_projects:
         projects = add_projects(zed_thread_projects())
         for project in projects:
@@ -1962,6 +2149,9 @@ def main(argv: list[str]) -> int:
         projects = default_projects(cwd, sync_zed=not args.no_zed_sync)
     ensure_slots(projects)
     threads = build_threads(projects, args.command)
+    if not args.no_zed_sync:
+        threads.extend(build_remote_threads(args.command))
+        ensure_slot_keys(thread.key for thread in threads)
     if args.warm:
         for thread in threads:
             thread.warm()

@@ -120,6 +120,33 @@ class RunnerStateTests(unittest.TestCase):
             ["zed", "zed://ssh/devbox/srv/project"],
         )
 
+    def test_zed_remote_specs_from_workspace_database(self) -> None:
+        db_dir = RUNNER.ZED_STATE_DIR / "db" / "0-stable"
+        db_dir.mkdir(parents=True)
+        con = sqlite3.connect(db_dir / "db.sqlite")
+        con.execute("create table remote_connections (id integer primary key, kind text, host text, port integer, user text)")
+        con.execute("create table workspaces (paths text, remote_connection_id integer, timestamp text)")
+        con.execute("insert into remote_connections values (?, ?, ?, ?, ?)", (1, "ssh", "devbox", 2222, "declan"))
+        con.execute("insert into workspaces values (?, ?, ?)", ("/srv/project", 1, "2026-05-12 10:00:00"))
+        con.commit()
+        con.close()
+
+        self.assertEqual(
+            RUNNER.zed_remote_thread_specs(),
+            [{"host": "declan@devbox:2222", "path": "/srv/project", "port": 2222}],
+        )
+        threads = RUNNER.build_remote_threads(None)
+        self.assertEqual(len(threads), 1)
+        self.assertTrue(threads[0].is_remote)
+        self.assertEqual(threads[0].key, "ssh:declan@devbox:2222:/srv/project")
+
+    def test_remote_command_runs_remote_nix_detection(self) -> None:
+        command = RUNNER.remote_command_for_project("declan@devbox", "/srv/project", "just test", 2222)
+        self.assertEqual(command[:4], ["ssh", "-p", "2222", "declan@devbox"])
+        self.assertIn("cd /srv/project", command[-1])
+        self.assertIn("nix develop", command[-1])
+        self.assertIn("nix-shell", command[-1])
+
     def test_registered_process_restores_as_running(self) -> None:
         project = Path(self.tempdir.name) / "project"
         project.mkdir()

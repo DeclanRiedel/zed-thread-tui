@@ -128,11 +128,47 @@ class RunnerStateTests(unittest.TestCase):
         thread = RUNNER.ThreadCommand(project=project, command="npm run dev", alias="api")
         ui = RUNNER.RunnerUi([thread], False, 4, "source")
 
-        row = ui.compact_row(">", "01", "* ^FN", thread, "running", "npm run dev")
+        row = ui.compact_row(">", "01", "* ^FN", thread, "running", "npm run dev", {"state": "done"})
 
         self.assertIn("api", row)
         self.assertIn("run", row)
-        self.assertLess(len(row), 80)
+        self.assertIn("npm:dev", row)
+        self.assertIn("!", row)
+        self.assertLess(len(row), 52)
+
+    def test_leader_slot_actions_include_stop_all_and_hide(self) -> None:
+        project_a = Path(self.tempdir.name) / "project-a"
+        project_b = Path(self.tempdir.name) / "project-b"
+        project_a.mkdir()
+        project_b.mkdir()
+        ui = RUNNER.RunnerUi(
+            [RUNNER.ThreadCommand(project=project_a, command=""), RUNNER.ThreadCommand(project=project_b, command="")],
+            False,
+            4,
+            "source",
+        )
+        ui.slots = {str(project_a): 1, str(project_b): 2}
+        stopped = []
+
+        def fake_stop_all() -> None:
+            stopped.append(ui.current.key)
+
+        ui.stop_all = fake_stop_all
+
+        ui.leader_active = True
+        ui.handle_leader_key(None, ord("2"))
+        ui.handle_leader_key(None, ord("a"))
+
+        self.assertEqual(stopped, [str(project_b)])
+        self.assertFalse(ui.leader_active)
+        self.assertEqual(ui.selected, 1)
+
+        ui.leader_active = True
+        ui.handle_leader_key(None, ord("1"))
+        ui.handle_leader_key(None, ord("h"))
+
+        self.assertEqual([thread.project for thread in ui.threads], [project_b])
+        self.assertEqual(RUNNER.hidden_thread_keys(), {str(project_a)})
 
     def test_thread_details_include_local_metadata(self) -> None:
         project = Path(self.tempdir.name) / "project"

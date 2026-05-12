@@ -35,6 +35,15 @@ Example:
   02 .  S  project-beta            idle         just test
 ```
 
+Compact mode (`v` or `--compact`) compresses each row into slot, icons, alias/name, short state, and shortened command:
+
+```text
+>01*@^FN! api        run  npm:dev
+ 02.--S-- web        idl  <cmd>
+```
+
+In compact rows, the final icon is AI state: `a` responding, `!` done and unchecked, `.` seen, `-` none.
+
 `N` is shown when the runner knows a live command or warm-up process is running for a project with `flake.nix`, `shell.nix`, or `default.nix`. It is process-based: the runner records the process group it started and refreshes whether that process group is still alive. It does not introspect arbitrary external shells.
 Remote rows cache nix wrapper detection in `remote-nix.json`. Press `w` on a remote row to probe/warm the remote nix shell; later runs reuse the cached wrapper instead of probing on every command.
 
@@ -72,7 +81,10 @@ When the terminal supports color, rows are color-coded by priority: focused, fai
 - `<leader>9e`: edit command for slot 9 from inside the TUI.
 - `<leader>9f`: focus slot 9 from inside the TUI.
 - `<leader>9r`: stop all and run slot 9 from inside the TUI.
+- `<leader>9s`: start or rerun slot 9 from inside the TUI.
 - `<leader>9x`: stop slot 9 from inside the TUI.
+- `<leader>9a`: stop all running commands from inside the TUI.
+- `<leader>9h`: hide slot 9 from inside the TUI.
 
 ## Commands
 

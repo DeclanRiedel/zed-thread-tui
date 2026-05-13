@@ -135,6 +135,8 @@ nix run . -- --install-zed-config
 nix run . -- --list-slots
 nix run . -- --reassign-slot /path/to/project-alpha 9
 nix run . -- --focus-id 9
+nix run . -- --leader-combo 9f
+nix run . -- --leader-combo 9R1
 nix run . -- --stop-all-first --focus-zed-on-run --run-id 9
 nix run . -- --stop-all-first --focus-zed-on-run --run-id 9 --cmd-slot 1
 nix run . -- --stop-id 9
@@ -198,6 +200,8 @@ After `--install-zed-config --slot-count 9`, you can add generated task bindings
 The focus action uses `zed --existing <project>`. Zed does not expose a public CLI/API to select an arbitrary existing Agent thread by ID.
 
 The TUI statusline shows the configured leader key, defaulting to `space`. Inside the TUI, use the thread ID before the action, such as `space 9 f`, `space 9 !`, or `space 9 R 1`.
+
+Outside the TUI, `--leader-combo` runs the same slot/action shape non-interactively for window-manager or Waybar integrations. Examples: `--leader-combo 9f` focuses slot 9, `--leader-combo 9!` runs `cmd1`, `--leader-combo 9@` runs `cmd2`, and `--leader-combo 9R1` stops all then runs slot 9 with `cmd1`. Edit combos (`e1`/`e2`) stay TUI-only.
 
 Focus keybinding mode is configurable. Use `--focus-only` when `space f 9` should only switch the Zed project, or `--focus-opens-threads-menu` before `--install-zed-config` when generated focus keybinding hints should also open the Agent thread switcher.
 

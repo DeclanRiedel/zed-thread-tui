@@ -3350,6 +3350,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Stop the tracked command for numeric slot ID.",
     )
     parser.add_argument(
+        "--leader-combo",
+        metavar="COMBO",
+        help="Run a TUI-style leader combo non-interactively, e.g. 9f, 9!, 9R1, or 9x.",
+    )
+    parser.add_argument(
         "--stop-all",
         action="store_true",
         help="Stop all tracked thread commands and exit unless --run-project is also provided.",
@@ -3767,6 +3772,69 @@ def stop_slot(slot: int) -> int:
     return 0
 
 
+def parse_leader_combo(combo: str) -> tuple[int, str] | None:
+    combo = combo.strip()
+    digits = ""
+    index = 0
+    while index < len(combo) and combo[index].isdigit():
+        digits += combo[index]
+        index += 1
+    action = combo[index:]
+    if not digits or not action:
+        return None
+    try:
+        slot = int(digits)
+    except ValueError:
+        return None
+    return slot, action
+
+
+def run_leader_combo(combo: str, focus_zed: bool, focus_limit: int) -> int:
+    parsed = parse_leader_combo(combo)
+    if parsed is None:
+        print("leader combo must be digits followed by an action, e.g. 9f or 9R1", file=sys.stderr)
+        return 2
+    slot, action = parsed
+    key = key_for_slot(slot)
+    if key is None:
+        print(f"no project assigned to slot {slot}", file=sys.stderr)
+        return 1
+    if action in ("e1", "e2"):
+        print(f"leader combo {combo} edits cmd{action[-1]}; open the TUI to edit commands", file=sys.stderr)
+        return 2
+    if action == "f":
+        return focus_slot(slot, focus_limit)
+    if action == "F":
+        if key.startswith("ssh:"):
+            print(f"slot {slot} is remote; Rider focus only supports local projects", file=sys.stderr)
+            return 1
+        process, message = focus_project_in_rider(Path(key))
+        print(message)
+        return 0 if process is not None else 1
+    if action == "r":
+        return run_slot(slot, None, focus_zed=focus_zed, stop_all_first=True, focus_limit=focus_limit)
+    if action == "x":
+        return stop_slot(slot)
+    if action == "a":
+        stop_all_registered_processes()
+        print(f"stopped all from slot {slot}: {key}")
+        return 0
+    if action == "h":
+        for hidden in hide_thread_keys([key]):
+            print(hidden)
+        return 0
+    if action == "!":
+        return run_slot(slot, None, focus_zed=focus_zed, stop_all_first=False, focus_limit=focus_limit, command_slot=1)
+    if action == "@":
+        return run_slot(slot, None, focus_zed=focus_zed, stop_all_first=False, focus_limit=focus_limit, command_slot=2)
+    if action in ("s1", "s2"):
+        return run_slot(slot, None, focus_zed=focus_zed, stop_all_first=False, focus_limit=focus_limit, command_slot=int(action[-1]))
+    if action in ("R1", "R2"):
+        return run_slot(slot, None, focus_zed=focus_zed, stop_all_first=True, focus_limit=focus_limit, command_slot=int(action[-1]))
+    print(f"unsupported leader combo action: {action}", file=sys.stderr)
+    return 2
+
+
 def print_slots(sync_zed: bool) -> None:
     projects = default_projects(Path.cwd().resolve(), sync_zed=sync_zed)
     keys = [str(project) for project in projects]
@@ -3962,6 +4030,9 @@ def main(argv: list[str]) -> int:
 
     if args.stop_id is not None:
         return stop_slot(args.stop_id)
+
+    if args.leader_combo:
+        return run_leader_combo(args.leader_combo, focus_zed=args.focus_zed_on_run, focus_limit=args.focus_limit)
 
     if args.run_id is not None:
         return run_slot(

@@ -86,6 +86,31 @@ class RunnerStateTests(unittest.TestCase):
         self.assertIsNone(RUNNER.project_for_slot(9))
         self.assertEqual(RUNNER.remote_parts_from_key(key), ("devbox", "/srv/project"))
 
+    def test_leader_combo_cli_parses_and_hides_slot(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        RUNNER.save_slots({str(project): 9})
+
+        self.assertEqual(RUNNER.parse_leader_combo("9R1"), (9, "R1"))
+        self.assertIsNone(RUNNER.parse_leader_combo("R1"))
+        self.assertEqual(RUNNER.run_leader_combo("9h", focus_zed=False, focus_limit=4), 0)
+        self.assertEqual(RUNNER.hidden_thread_keys(), {str(project)})
+
+    def test_leader_combo_cli_dispatches_command_slot(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        RUNNER.save_slots({str(project): 9})
+        calls = []
+        original_run_slot = RUNNER.run_slot
+        try:
+            RUNNER.run_slot = lambda *args, **kwargs: calls.append((args, kwargs)) or 0
+
+            self.assertEqual(RUNNER.run_leader_combo("9R2", focus_zed=True, focus_limit=4), 0)
+        finally:
+            RUNNER.run_slot = original_run_slot
+
+        self.assertEqual(calls, [((9, None), {"focus_zed": True, "stop_all_first": True, "focus_limit": 4, "command_slot": 2})])
+
     def test_command_history_deduplicates_and_limits(self) -> None:
         key = "ssh:devbox:/srv/project"
         RUNNER.record_command_history(key, "just test", limit=3)

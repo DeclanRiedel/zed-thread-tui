@@ -35,7 +35,7 @@ Example:
   02 .  S  project-beta            idle         just test
 ```
 
-Compact mode (`v` or `--compact`) compresses each row into slot, icons, alias/name, short state, and shortened command:
+Compact mode (`v` or `--compact`) compresses each row into slot, icons, alias/name, short state, and the primary command:
 
 ```text
 >01*@^FN! api        run  npm:dev
@@ -43,6 +43,8 @@ Compact mode (`v` or `--compact`) compresses each row into slot, icons, alias/na
 ```
 
 In compact rows, the final icon is AI state: `a` responding, `!` done and unchecked, `.` seen, `-` none.
+`cmd1` is the default command shown and run by the row. Enable `show cmd2 in rows` in settings to append the secondary command; empty slots display as `<cmd>` and `<cmd2>`.
+When both commands are visible, the currently active command is bracketed.
 
 `N` is shown when the runner knows a live command or warm-up process is running for a project with `flake.nix`, `shell.nix`, or `default.nix`. It is process-based: the runner records the process group it started and refreshes whether that process group is still alive. It does not introspect arbitrary external shells.
 Remote rows cache nix wrapper detection in `remote-nix.json`. Press `w` on a remote row to probe/warm the remote nix shell; later runs reuse the cached wrapper instead of probing on every command.
@@ -62,26 +64,38 @@ When the terminal supports color, rows are color-coded by priority: focused, fai
 - `/` / `u`: filter / clear filter.
 - `o`: cycle sort mode.
 - `v`: toggle normal / compact row layout.
-- `enter` / `e`: edit command. In the command prompt, `up` / `down` cycle that thread's command history and `tab` completes from history/presets.
-- `c` / `C` / `P`: cycle preset / pick command history / save current command as preset.
+- `enter`: edit the single/default command.
+- `e`: edit the single/default command when multi-command mode is off; in multi-command mode, press `e1` or `e2` to edit `cmd1` or `cmd2`.
+- `s`: start the single/default command when multi-command mode is off; in multi-command mode, press `s1` or `s2` to run `cmd1` or `cmd2`.
+- `!` / `@`: run selected thread with `cmd1` or `cmd2` when multi-command mode is on.
+- `P`: save the current command into `cmd1` or `cmd2`.
+- `c` / `C`: cycle legacy preset / pick command history.
 - `t`: toggle log tail pane.
-- `i`: toggle selected-thread details pane.
+- `i`: toggle selected-thread details pane, including command slots, process IDs, nix mode, SSH dependency, and log tail.
+- `g`: open settings popup for persisted runner settings.
+- `G`: open SSH connection manager.
+- `D`: set or clear the selected thread's required SSH connection.
+- `O`: open the tracked process dashboard and stop an entry.
 - `f`: focus/open selected project in Zed.
 - `p`: add project path.
 - `h` / `H`: hide selected thread / list hidden threads and unhide one.
 - `n`: set or clear an alias for the selected thread.
 - `b`: pin/unpin selected thread.
 - `A` / `U` / `M`: mark selected AI response seen / unchecked / mark all done seen.
-- `s`: start or rerun selected command.
 - `r`: stop all, focus selected project, run selected command.
 - `x` / `a`: stop selected / stop all.
 - `w` / `W`: warm selected/all nix shells.
 - `q` / `Q`: quit and leave commands running / quit and stop all.
 - `<leader>`: toggle leader mode and change the statusline color.
-- `<leader>9e`: edit command for slot 9 from inside the TUI.
+- `<leader>9e1` / `<leader>9e2`: edit `cmd1` or `cmd2` for slot 9 from inside the TUI.
 - `<leader>9f`: focus slot 9 from inside the TUI.
+- `<leader>9F`: focus slot 9 in Rider with `rider <path>` and close Rider launcher processes for other threads.
 - `<leader>9r`: stop all and run slot 9 from inside the TUI.
-- `<leader>9s`: start or rerun slot 9 from inside the TUI.
+- `<leader>9s1` / `<leader>9s2`: start or rerun slot 9 with `cmd1` or `cmd2`.
+- `<leader>9!`: run slot 9 with `cmd1`.
+- `<leader>9@`: run slot 9 with `cmd2`.
+- `<leader>9R1`: stop all, then run slot 9 with `cmd1`.
+- `<leader>9R2`: stop all, then run slot 9 with `cmd2`.
 - `<leader>9x`: stop slot 9 from inside the TUI.
 - `<leader>9a`: stop all running commands from inside the TUI.
 - `<leader>9h`: hide slot 9 from inside the TUI.
@@ -110,13 +124,19 @@ nix run . -- --unpin-project /path/to/project-alpha
 nix run . -- --list-pinned
 nix run . -- --set-preset /path/to/project-alpha dev "npm run dev"
 nix run . -- --list-presets /path/to/project-alpha
+nix run . -- --set-cmd-slot /path/to/project-alpha 1 "nix run .#dev"
+nix run . -- --set-cmd-slot /path/to/project-alpha 2 "nix run .#test"
+nix run . -- --list-cmd-slots /path/to/project-alpha
 nix run . -- --stop-all
 nix run . -- --focus-limit 4
+nix run . -- --focus-only
+nix run . -- --focus-opens-threads-menu
 nix run . -- --install-zed-config
 nix run . -- --list-slots
 nix run . -- --reassign-slot /path/to/project-alpha 9
 nix run . -- --focus-id 9
 nix run . -- --stop-all-first --focus-zed-on-run --run-id 9
+nix run . -- --stop-all-first --focus-zed-on-run --run-id 9 --cmd-slot 1
 nix run . -- --stop-id 9
 nix run . -- --remote-focus-probe devbox /srv/project
 nix run . -- --remote-focus-probe devbox /srv/project --try-remote-focus
@@ -168,6 +188,8 @@ After `--install-zed-config --slot-count 9`, you can add generated task bindings
   "bindings": {
     "space f 9": ["task::Spawn", { "task_name": "thread runner: focus 9" }],
     "space r 9": ["task::Spawn", { "task_name": "thread runner: stop all then run 9" }],
+    "space r 9 1": ["task::Spawn", { "task_name": "thread runner: stop all then run 9 cmd1" }],
+    "space r 9 2": ["task::Spawn", { "task_name": "thread runner: stop all then run 9 cmd2" }],
     "space x 9": ["task::Spawn", { "task_name": "thread runner: stop 9" }]
   }
 }
@@ -175,7 +197,14 @@ After `--install-zed-config --slot-count 9`, you can add generated task bindings
 
 The focus action uses `zed --existing <project>`. Zed does not expose a public CLI/API to select an arbitrary existing Agent thread by ID.
 
-The TUI statusline shows the configured leader key, defaulting to `space`, so the slot bindings read as `space f 9`, `space r 9`, and `space x 9`.
+The TUI statusline shows the configured leader key, defaulting to `space`. Inside the TUI, use the thread ID before the action, such as `space 9 f`, `space 9 !`, or `space 9 R 1`.
+
+Focus keybinding mode is configurable. Use `--focus-only` when `space f 9` should only switch the Zed project, or `--focus-opens-threads-menu` before `--install-zed-config` when generated focus keybinding hints should also open the Agent thread switcher.
+
+The in-TUI settings popup (`g`) persists the runner settings in `config.json`: compact mode, multi-command mode, optional `cmd2` row display, focus-before-run, Zed focus polling, generated focus-menu behavior, sort mode, focus cap, and leader key.
+The SSH manager (`G`) persists user-entered SSH commands locally and can start/stop them as background connection processes. Press `A` in the SSH menu to toggle auto-start for a connection. Auto-start connections launch when the TUI opens, and SSH connections continue running after `q`; stop them from `G`, delete them, or quit with `Q`.
+Saved SSH commands must start with `ssh`; names and commands are stored only in your local runner config. When adding a connection, you can paste a full `ssh ...` command at the first prompt and the runner will derive a local display name.
+Use `D` on a thread to assign a saved SSH connection as a dependency. When that thread is run, the TUI starts the dependency first if it is not already running.
 
 ## Development
 

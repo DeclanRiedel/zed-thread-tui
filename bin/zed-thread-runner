@@ -59,10 +59,16 @@ def default_config() -> dict[str, object]:
         "sort_mode": "source",
         "compact": False,
         "trust_zed_focus": False,
+        "open_threads_menu_on_focus": False,
+        "focus_zed_on_run": False,
+        "show_cmd2_in_rows": False,
+        "multi_command_mode": False,
         "hidden_projects": [],
         "hidden_threads": [],
         "pinned_projects": [],
         "remote_focus": {},
+        "ssh_connections": [],
+        "thread_ssh_dependencies": {},
     }
 
 
@@ -423,6 +429,29 @@ def load_command_history() -> dict[str, list[str]]:
     return history
 
 
+def load_command_slots() -> dict[str, dict[str, str]]:
+    path = state_dir() / "command-slots.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    slots: dict[str, dict[str, str]] = {}
+    for key, values in data.items():
+        if not isinstance(values, dict):
+            continue
+        cmd1 = str(values.get("cmd1", "")).strip()
+        cmd2 = str(values.get("cmd2", "")).strip()
+        active = str(values.get("active", "manual"))
+        if active not in ("1", "2", "manual"):
+            active = "manual"
+        slots[str(key)] = {"cmd1": cmd1, "cmd2": cmd2, "active": active}
+    return slots
+
+
 def load_aliases() -> dict[str, str]:
     path = state_dir() / "aliases.json"
     if not path.exists():
@@ -523,6 +552,12 @@ def save_command_history(history: dict[str, list[str]]) -> None:
     target.write_text(json.dumps(history, indent=2, sort_keys=True) + "\n")
 
 
+def save_command_slots(slots: dict[str, dict[str, str]]) -> None:
+    target = state_dir() / "command-slots.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(slots, indent=2, sort_keys=True) + "\n")
+
+
 def record_command_history(key: str, command: str, limit: int = COMMAND_HISTORY_LIMIT) -> list[str]:
     command = command.strip()
     if not command:
@@ -532,6 +567,78 @@ def record_command_history(key: str, command: str, limit: int = COMMAND_HISTORY_
     history[key] = entries[:limit]
     save_command_history(history)
     return history[key]
+
+
+def default_command_slot_state() -> dict[str, str]:
+    return {"cmd1": "", "cmd2": "", "active": "manual"}
+
+
+def command_slot_state(key: str, slots: dict[str, dict[str, str]] | None = None) -> dict[str, str]:
+    data = (slots if slots is not None else load_command_slots()).get(key, {})
+    state = default_command_slot_state()
+    state.update({name: str(data.get(name, "")).strip() for name in ("cmd1", "cmd2")})
+    active = str(data.get("active", "manual"))
+    state["active"] = active if active in ("1", "2", "manual") else "manual"
+    return state
+
+
+def save_thread_command_slot(key: str, slot: int, command: str, active: bool = False) -> dict[str, str]:
+    if slot not in (1, 2):
+        raise ValueError("command slot must be 1 or 2")
+    slots = load_command_slots()
+    state = command_slot_state(key, slots)
+    state[f"cmd{slot}"] = command.strip()
+    if active:
+        state["active"] = str(slot)
+    slots[key] = state
+    save_command_slots(slots)
+    return state
+
+
+def set_active_command_slot(key: str, slot: int | str) -> dict[str, str]:
+    if slot not in (1, 2, "1", "2", "manual"):
+        raise ValueError("active command slot must be 1, 2, or manual")
+    slots = load_command_slots()
+    state = command_slot_state(key, slots)
+    state["active"] = str(slot)
+    slots[key] = state
+    save_command_slots(slots)
+    return state
+
+
+def command_for_slot(key: str, slot: int, slots: dict[str, dict[str, str]] | None = None) -> str:
+    if slot not in (1, 2):
+        raise ValueError("command slot must be 1 or 2")
+    state = command_slot_state(key, slots)
+    return state.get(f"cmd{slot}", "").strip()
+
+
+def active_command_slot(key: str, command: str, slots: dict[str, dict[str, str]] | None = None) -> str:
+    state = command_slot_state(key, slots)
+    command = command.strip()
+    if command and command == state.get("cmd1", ""):
+        return "1"
+    if command and command == state.get("cmd2", ""):
+        return "2"
+    if command:
+        return "manual"
+    active = state.get("active", "manual")
+    if active in ("1", "2") and state.get(f"cmd{active}", ""):
+        return active
+    return "manual"
+
+
+def effective_command_for_key(key: str, default_command: str | None, commands: dict[str, str] | None = None) -> str:
+    state = command_slot_state(key)
+    if state.get("cmd1", ""):
+        return state["cmd1"]
+    command = (commands if commands is not None else load_commands()).get(key, "").strip()
+    if command:
+        return command
+    active = state.get("active", "manual")
+    if active in ("1", "2") and state.get(f"cmd{active}", ""):
+        return state[f"cmd{active}"]
+    return default_command or ""
 
 
 def save_aliases(aliases: dict[str, str]) -> None:
@@ -737,11 +844,11 @@ def save_processes(processes: dict[str, dict[str, int | str]]) -> None:
     target.write_text(json.dumps(processes, indent=2, sort_keys=True) + "\n")
 
 
-def register_process(project: Path, process: subprocess.Popen[bytes], command: str) -> None:
-    register_process_key(str(project), process, command)
+def register_process(project: Path, process: subprocess.Popen[bytes], command: str, command_slot: str = "manual") -> None:
+    register_process_key(str(project), process, command, command_slot)
 
 
-def register_process_key(key: str, process: subprocess.Popen[bytes], command: str) -> None:
+def register_process_key(key: str, process: subprocess.Popen[bytes], command: str, command_slot: str = "manual") -> None:
     processes = load_processes()
     try:
         pgid = os.getpgid(process.pid)
@@ -751,8 +858,13 @@ def register_process_key(key: str, process: subprocess.Popen[bytes], command: st
         "pid": process.pid,
         "pgid": pgid,
         "command": command,
+        "command_slot": command_slot,
     }
     save_processes(processes)
+
+
+def ssh_process_key(name: str) -> str:
+    return f"ssh-connection:{name}"
 
 
 def is_pgid_alive(pgid: int) -> bool:
@@ -796,12 +908,16 @@ def stop_process_group(pgid: int) -> None:
 def stop_all_registered_processes() -> int:
     processes = load_processes()
     stopped = 0
-    for data in processes.values():
+    kept: dict[str, dict[str, int | str]] = {}
+    for key, data in processes.items():
+        if key.startswith("ssh-connection:"):
+            kept[key] = data
+            continue
         pgid = data.get("pgid")
         if isinstance(pgid, int):
             stop_process_group(pgid)
             stopped += 1
-    save_processes({})
+    save_processes(kept)
     return stopped
 
 
@@ -1177,6 +1293,127 @@ def focus_project_in_zed(project: Path, focus_limit: int = MAX_FOCUSED_WORKTREES
     return f"focused zed: {project.name}", popped
 
 
+def focus_project_in_rider(project: Path) -> tuple[subprocess.Popen[bytes] | None, str]:
+    try:
+        process = subprocess.Popen(
+            ["rider", str(project)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as error:
+        return None, f"rider focus failed: {error}"
+    return process, f"focused rider: {project.name}"
+
+
+def set_open_threads_menu_on_focus(enabled: bool) -> dict[str, object]:
+    config = load_config()
+    config["open_threads_menu_on_focus"] = enabled
+    save_config(config)
+    return config
+
+
+def load_ssh_connections() -> list[dict[str, object]]:
+    raw = load_config().get("ssh_connections", [])
+    if not isinstance(raw, list):
+        return []
+    connections: list[dict[str, object]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip()
+        command = str(entry.get("command", "")).strip()
+        if name and command:
+            connection: dict[str, object] = {"name": name, "command": command}
+            if bool(entry.get("auto_start", False)):
+                connection["auto_start"] = True
+            connections.append(connection)
+    return connections
+
+
+def ssh_connection_name_from_command(command: str) -> str:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return "ssh-connection"
+    destination = next((part for part in reversed(argv[1:]) if not part.startswith("-") and ":" not in part), "")
+    if not destination:
+        destination = "ssh-connection"
+    name = "".join(ch if ch.isalnum() or ch in "._@-" else "-" for ch in destination)
+    return name.strip("-") or "ssh-connection"
+
+
+def ssh_connection_runtime_argv(command: str) -> list[str]:
+    argv = shlex.split(command)
+    if not argv or argv[0] != "ssh":
+        return argv
+    if "-N" in argv:
+        return argv
+    has_forward = any(arg in ("-L", "-R", "-D") or arg.startswith(("-L", "-R", "-D")) for arg in argv[1:])
+    if not has_forward:
+        return argv
+    return [argv[0], "-N", *argv[1:]]
+
+
+def save_ssh_connections(connections: list[dict[str, object]]) -> None:
+    config = load_config()
+    normalized: list[dict[str, object]] = []
+    for entry in connections:
+        name = str(entry.get("name", "")).strip()
+        command = str(entry.get("command", "")).strip()
+        if not name or not command:
+            continue
+        connection: dict[str, object] = {"name": name, "command": command}
+        if bool(entry.get("auto_start", False)):
+            connection["auto_start"] = True
+        normalized.append(connection)
+    config["ssh_connections"] = normalized
+    save_config(config)
+
+
+def load_thread_ssh_dependencies() -> dict[str, str]:
+    raw = load_config().get("thread_ssh_dependencies", {})
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): str(value) for key, value in raw.items() if str(key).strip() and str(value).strip()}
+
+
+def save_thread_ssh_dependencies(dependencies: dict[str, str]) -> None:
+    config = load_config()
+    config["thread_ssh_dependencies"] = {str(key): str(value) for key, value in dependencies.items() if str(value).strip()}
+    save_config(config)
+
+
+def set_thread_ssh_dependency(thread_key: str, connection_name: str | None) -> dict[str, str]:
+    dependencies = load_thread_ssh_dependencies()
+    if connection_name:
+        dependencies[thread_key] = connection_name
+    else:
+        dependencies.pop(thread_key, None)
+    save_thread_ssh_dependencies(dependencies)
+    return dependencies
+
+
+def ssh_connection_log_path(name: str) -> Path:
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
+    return state_dir() / "logs" / f"ssh_{safe}.log"
+
+
+def zed_focus_binding(task_name: str, open_threads_menu: bool) -> list[object]:
+    task_binding: list[object] = ["task::Spawn", {"task_name": task_name}]
+    if not open_threads_menu:
+        return task_binding
+    return [
+        "action::Sequence",
+        [
+            task_binding,
+            "agent::ToggleFocus",
+            "agents_sidebar::ToggleThreadSwitcher",
+        ],
+    ]
+
+
 @dataclass
 class ThreadCommand:
     project: Path
@@ -1189,6 +1426,7 @@ class ThreadCommand:
     warm_process: subprocess.Popen[bytes] | None = None
     registered_pgid: int | None = None
     registered_pid: int | None = None
+    running_slot: str = "manual"
     last_status: str = "idle"
     last_exit: int | None = None
 
@@ -1227,6 +1465,7 @@ class ThreadCommand:
                 self.last_exit = exit_code
                 self.last_status = f"exited {exit_code}"
                 self.process = None
+                self.running_slot = "manual"
                 unregister_process_key(self.key)
         elif self.registered_pgid is not None:
             if is_pgid_alive(self.registered_pgid):
@@ -1234,6 +1473,7 @@ class ThreadCommand:
             else:
                 self.registered_pgid = None
                 self.registered_pid = None
+                self.running_slot = "manual"
                 self.last_status = "exited ?"
                 unregister_process_key(self.key)
         if self.warm_process is not None:
@@ -1242,7 +1482,7 @@ class ThreadCommand:
                 self.last_status = "nix warmed" if exit_code == 0 else f"warm failed {exit_code}"
                 self.warm_process = None
 
-    def start(self) -> None:
+    def start(self, command_slot: str = "manual") -> None:
         if not self.command.strip():
             self.last_status = "missing command"
             return
@@ -1264,8 +1504,9 @@ class ThreadCommand:
                 stdin=subprocess.DEVNULL,
                 preexec_fn=os.setsid,
             )
-            register_process_key(self.key, self.process, self.command)
+            register_process_key(self.key, self.process, self.command, command_slot)
         self.last_status = "running"
+        self.running_slot = command_slot
         self.last_exit = None
 
     def command_argv(self, nix_kind: str = "auto") -> list[str]:
@@ -1317,10 +1558,12 @@ class ThreadCommand:
         self.last_status = "warming"
 
     def stop(self) -> None:
+        self.stop_warm()
         if self.registered_pgid is not None:
             stop_process_group(self.registered_pgid)
             self.registered_pgid = None
             self.registered_pid = None
+            self.running_slot = "manual"
             unregister_process_key(self.key)
             self.last_status = "stopped"
             return
@@ -1344,8 +1587,30 @@ class ThreadCommand:
                 pass
         self.last_exit = self.process.poll()
         self.process = None
+        self.running_slot = "manual"
         unregister_process_key(self.key)
         self.last_status = "stopped"
+
+    def stop_warm(self) -> None:
+        if self.warm_process is None or self.warm_process.poll() is not None:
+            self.warm_process = None
+            return
+        try:
+            os.killpg(os.getpgid(self.warm_process.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            self.warm_process = None
+            return
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if self.warm_process.poll() is not None:
+                break
+            time.sleep(0.05)
+        if self.warm_process.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.warm_process.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.warm_process = None
 
 
 class RunnerUi:
@@ -1360,14 +1625,20 @@ class RunnerUi:
         self.show_details = False
         self.sort_mode = sort_mode if sort_mode in SORT_MODES else "source"
         self.compact = bool(load_config().get("compact", False))
+        self.show_cmd2_in_rows = bool(load_config().get("show_cmd2_in_rows", False))
+        self.multi_command_mode = bool(load_config().get("multi_command_mode", False))
         self.leader_key = str(load_config().get("leader_key", "space"))
         self.trust_zed_focus = bool(load_config().get("trust_zed_focus", False))
         self.leader_active = False
         self.leader_slot_digits = ""
-        self.message = "enter edit | / filter | o sort | t log | c preset | f focus | s run | q quit"
+        self.leader_pending_action = ""
+        self.pending_row_action = ""
+        self.message = "enter edit | / filter | o sort | !/@ cmd1/2 run | f focus | s run | q quit"
         self.commands = load_commands()
+        self.command_slots = load_command_slots()
         self.presets = load_presets()
         self.aliases = load_aliases()
+        self.thread_ssh_dependencies = load_thread_ssh_dependencies()
         self.pinned_projects = pinned_projects()
         self.ai_states: dict[str, dict[str, str | float]] = {}
         self.ai_states_checked_at = 0.0
@@ -1375,12 +1646,15 @@ class RunnerUi:
         self.focused_project_checked_at = 0.0
         self.focused_remote_key: str | None = None
         self.focused_remote_checked_at = 0.0
+        self.rider_processes: dict[str, subprocess.Popen[bytes]] = {}
+        self.ssh_processes: dict[str, subprocess.Popen[bytes]] = {}
 
     def run(self, stdscr: curses.window) -> None:
         curses.curs_set(0)
         self.init_colors()
         stdscr.nodelay(True)
         stdscr.keypad(True)
+        self.auto_start_ssh_connections()
         while True:
             for thread in self.threads:
                 thread.poll()
@@ -1390,9 +1664,13 @@ class RunnerUi:
                 time.sleep(0.1)
                 continue
             if key in (ord("q"), 27):
+                self.stop_warm_processes()
+                self.stop_all_rider_processes()
                 return
             if key == ord("Q"):
                 self.stop_all()
+                self.stop_all_rider_processes()
+                self.stop_all_ssh_connections()
                 return
             self.handle_key(stdscr, key)
 
@@ -1419,7 +1697,7 @@ class RunnerUi:
             thread = self.threads[thread_idx]
             marker = ">" if thread_idx == self.selected else " "
             token = self.thread_token(thread, focused_project, focused_remote_key)
-            command = display_text(thread.command or "<enter command>")
+            command = self.row_command_text(thread)
             status = display_text(thread.last_status)
             slot = format_slot(self.slots.get(thread.key))
             if self.compact:
@@ -1444,10 +1722,11 @@ class RunnerUi:
         if height >= 2:
             leader_state = "on" if self.leader_active else "off"
             pending = self.leader_slot_digits or "-"
-            suffix = f" leader={self.leader_key}:{leader_state} slot={pending} filter={self.filter_query or '-'} sort={self.sort_mode} view={'compact' if self.compact else 'normal'}"
+            leader_action = self.leader_pending_action or "-"
+            suffix = f" leader={self.leader_key}:{leader_state} slot={pending} action={leader_action} filter={self.filter_query or '-'} sort={self.sort_mode} view={'compact' if self.compact else 'normal'}"
             status_attr = curses.A_REVERSE if self.leader_active else curses.A_DIM
             self.write_line(stdscr, height - 2, f"{self.message} |{suffix}", status_attr)
-            buttons = "[Focus:f] [Run:s] [Stop:x/a] [Hide:h/H] [Alias:n] [Pin:b] [Info:i] [Preset:c/P] [Log:t] [AI:A/U/M] [Quit:q/Q]"
+            buttons = "[Focus:f] [Run:s !/@] [Cmd:e/s/P] [Settings:g/G] [SSH:D] [Proc:O] [Stop:x/a] [Info:i] [Quit:q/Q]"
             self.write_line(stdscr, height - 1, buttons, curses.A_REVERSE)
         stdscr.refresh()
 
@@ -1479,6 +1758,31 @@ class RunnerUi:
         short_command = self.compact_command(command)
         flags = self.compact_flags(token, ai_state)
         return f"{marker}{slot}{flags} {name:<10} {short_status:<4} {short_command}"
+
+    def row_command_text(self, thread: ThreadCommand) -> str:
+        slots = command_slot_state(thread.key, self.command_slots)
+        primary = slots.get("cmd1") or thread.command.strip() or "<cmd>"
+        active = self.display_command_slot(thread)
+        primary = self.active_command_text(primary, active == "1")
+        if not self.multi_command_mode or not self.show_cmd2_in_rows:
+            return display_text(primary)
+        secondary = slots.get("cmd2") or "<cmd2>"
+        secondary = self.active_command_text(secondary, active == "2")
+        return display_text(f"{primary}  {secondary}")
+
+    def active_command_text(self, command: str, active: bool) -> str:
+        return f"[{command}]" if active else command
+
+    def display_command_slot(self, thread: ThreadCommand) -> str:
+        if self.is_running(thread) and thread.running_slot in ("1", "2"):
+            return thread.running_slot
+        return active_command_slot(thread.key, thread.command, self.command_slots)
+
+    def command_slot_label(self, thread: ThreadCommand) -> str:
+        active = active_command_slot(thread.key, thread.command, self.command_slots)
+        if active in ("1", "2"):
+            return f"c{active}"
+        return "cm" if thread.command.strip() else "c-"
 
     def compact_name(self, thread: ThreadCommand) -> str:
         name = display_text(thread.name)
@@ -1592,9 +1896,9 @@ class RunnerUi:
             return self.color_attr(COLOR_FOCUSED) | curses.A_BOLD
         if self.is_failed(thread):
             return self.color_attr(COLOR_FAILED) | curses.A_BOLD
+        if self.is_running(thread) and thread.warm_process is not None and thread.warm_process.poll() is None:
+            return self.color_attr(COLOR_WARMING) | curses.A_BOLD
         if self.is_running(thread):
-            if thread.warm_process is not None and thread.warm_process.poll() is None:
-                return self.color_attr(COLOR_WARMING) | curses.A_BOLD
             return self.color_attr(COLOR_RUNNING) | curses.A_BOLD
         if ai_state and ai_state.get("state") == "done":
             return self.color_attr(COLOR_AI_DONE) | curses.A_BOLD
@@ -1670,9 +1974,13 @@ class RunnerUi:
             self.message = f"AI auto-seen: {focused_project.name}"
 
     def handle_key(self, stdscr: curses.window, key: int) -> None:
+        if self.pending_row_action:
+            self.handle_pending_row_action(stdscr, key)
+            return
         if self.is_leader_key(key):
             self.leader_active = not self.leader_active
             self.leader_slot_digits = ""
+            self.leader_pending_action = ""
             self.message = f"leader active: use <id>{self.leader_action_help()}" if self.leader_active else "leader off"
             return
         if self.leader_active:
@@ -1682,8 +1990,14 @@ class RunnerUi:
             self.move_selection(-1)
         elif key in (curses.KEY_DOWN, ord("j")):
             self.move_selection(1)
-        elif key in (curses.KEY_ENTER, 10, 13, ord("e")):
+        elif key in (curses.KEY_ENTER, 10, 13):
             self.edit_command(stdscr)
+        elif key == ord("e"):
+            if self.multi_command_mode:
+                self.pending_row_action = "e"
+                self.message = "edit command slot: 1 cmd1 | 2 cmd2 | q cancel"
+            else:
+                self.edit_command(stdscr)
         elif key == ord("/"):
             self.set_filter(stdscr)
         elif key == ord("u"):
@@ -1703,12 +2017,27 @@ class RunnerUi:
             if self.show_details:
                 self.show_log = False
             self.message = "details shown" if self.show_details else "details hidden"
+        elif key == ord("g"):
+            self.settings_menu(stdscr)
+        elif key == ord("G"):
+            self.ssh_connections_menu(stdscr)
+        elif key == ord("O"):
+            self.process_dashboard(stdscr)
         elif key == ord("c"):
             self.cycle_preset()
         elif key == ord("C"):
             self.pick_command_history(stdscr)
         elif key == ord("P"):
-            self.save_preset(stdscr)
+            self.save_current_command_slot(stdscr)
+        elif key in (ord("1"), ord("2")):
+            if self.multi_command_mode:
+                self.message = "use e1/e2 to edit or s1/s2 to run command slots"
+            else:
+                self.message = "multi-command mode is off"
+        elif key == ord("!"):
+            self.use_command_slot(1, run=True, stop_all_first=False) if self.multi_command_mode else self.simple_mode_message()
+        elif key == ord("@"):
+            self.use_command_slot(2, run=True, stop_all_first=False) if self.multi_command_mode else self.simple_mode_message()
         elif key == ord("h"):
             self.hide_current()
         elif key == ord("H"):
@@ -1719,8 +2048,14 @@ class RunnerUi:
             self.alias_current(stdscr)
         elif key == ord("b"):
             self.toggle_pin_current()
+        elif key == ord("D"):
+            self.set_ssh_dependency_menu(stdscr)
         elif key == ord("s"):
-            self.start_current(stop_all_first=False)
+            if self.multi_command_mode:
+                self.pending_row_action = "s"
+                self.message = "run command slot: 1 cmd1 | 2 cmd2 | q cancel"
+            else:
+                self.start_current(stop_all_first=False)
         elif key == ord("r"):
             self.start_current(stop_all_first=True)
         elif key == ord("x"):
@@ -1738,6 +2073,8 @@ class RunnerUi:
             self.message = f"log: {self.current.log_path}"
         elif key in (ord("f"), ord("z")):
             self.focus_current()
+        elif key == ord("F"):
+            self.focus_current_rider()
         elif key == ord("A"):
             self.mark_ai_seen(self.current)
         elif key == ord("U"):
@@ -1745,15 +2082,72 @@ class RunnerUi:
         elif key == ord("M"):
             self.mark_all_ai_seen()
 
+    def handle_pending_row_action(self, stdscr: curses.window, key: int) -> None:
+        action = self.pending_row_action
+        if key in (27, ord("q")):
+            self.pending_row_action = ""
+            self.message = f"{action} cancelled"
+            return
+        if key not in (ord("1"), ord("2")):
+            self.message = f"{action}: press 1 or 2, q cancels"
+            return
+        slot = int(chr(key))
+        self.pending_row_action = ""
+        if action == "e":
+            self.edit_command_slot(stdscr, slot)
+            return
+        if action == "s":
+            self.use_command_slot(slot, run=True, stop_all_first=False)
+            return
+
+    def simple_mode_message(self) -> None:
+        self.message = "multi-command mode is off"
+
     def is_leader_key(self, key: int) -> bool:
         if self.leader_key in ("space", "Space", "<space>", "<leader>"):
             return key == ord(" ")
         return len(self.leader_key) == 1 and key == ord(self.leader_key)
 
     def handle_leader_key(self, stdscr: curses.window, key: int) -> None:
+        if self.leader_pending_action in ("e", "s", "R"):
+            if key in (ord("1"), ord("2")):
+                if not self.leader_slot_digits:
+                    self.message = f"leader needs slot number first, e.g. <leader>9{self.leader_pending_action}1"
+                    return
+                slot = int(self.leader_slot_digits)
+                action = f"{self.leader_pending_action}{chr(key)}"
+                if action in ("e1", "e2", "s1", "s2", "R1", "R2") and not self.multi_command_mode:
+                    self.message = "multi-command mode is off"
+                    self.leader_active = False
+                    self.leader_slot_digits = ""
+                    self.leader_pending_action = ""
+                    return
+                self.run_leader_slot_action(stdscr, slot, action)
+                self.leader_active = False
+                self.leader_slot_digits = ""
+                self.leader_pending_action = ""
+                return
+            if key in (27, ord("q")):
+                self.leader_active = False
+                self.leader_slot_digits = ""
+                self.leader_pending_action = ""
+                self.message = "leader off"
+                return
+            self.message = f"leader slot {self.leader_slot_digits} {self.leader_pending_action}: 1 cmd1 | 2 cmd2"
+            return
         if ord("0") <= key <= ord("9"):
             self.leader_slot_digits += chr(key)
             self.message = f"leader slot {self.leader_slot_digits}: {self.leader_action_help()}"
+            return
+        if key in (ord("e"), ord("s"), ord("R")):
+            if not self.multi_command_mode:
+                self.message = "multi-command mode is off"
+                return
+            if not self.leader_slot_digits:
+                self.message = f"leader needs slot number first, e.g. <leader>9{chr(key)}1"
+                return
+            self.leader_pending_action = chr(key)
+            self.message = f"leader slot {self.leader_slot_digits} {chr(key)}: 1 cmd1 | 2 cmd2"
             return
         if key in self.leader_action_keys():
             if not self.leader_slot_digits:
@@ -1763,19 +2157,21 @@ class RunnerUi:
             self.run_leader_slot_action(stdscr, slot, chr(key))
             self.leader_active = False
             self.leader_slot_digits = ""
+            self.leader_pending_action = ""
             return
         if key in (27, ord("q")):
             self.leader_active = False
             self.leader_slot_digits = ""
+            self.leader_pending_action = ""
             self.message = "leader off"
             return
         self.message = f"leader: use digits then {self.leader_action_help()}, or leader again to cancel"
 
     def leader_action_keys(self) -> tuple[int, ...]:
-        return tuple(ord(action) for action in "efrsxah")
+        return tuple(ord(action) for action in "frFxah!@")
 
     def leader_action_help(self) -> str:
-        return "e edit | f focus | r stop+run | s start | x stop | a stop all | h hide"
+        return "e1/e2 edit | s1/s2 run | f/F/r/x/a/h | !/@ run | R1/R2 stop+run"
 
     def run_leader_slot_action(self, stdscr: curses.window, slot: int, action: str) -> None:
         thread = self.thread_for_slot(slot)
@@ -1783,14 +2179,28 @@ class RunnerUi:
             self.message = f"slot {slot} not found"
             return
         self.selected = self.threads.index(thread)
-        if action == "e":
-            self.edit_command(stdscr)
+        if action == "e1":
+            self.edit_command_slot(stdscr, 1)
+        elif action == "e2":
+            self.edit_command_slot(stdscr, 2)
         elif action == "f":
             self.focus_current()
+        elif action == "F":
+            self.focus_current_rider()
         elif action == "r":
             self.start_current(stop_all_first=True)
-        elif action == "s":
-            self.start_current(stop_all_first=False)
+        elif action == "s1":
+            self.use_command_slot(1, run=True, stop_all_first=False)
+        elif action == "s2":
+            self.use_command_slot(2, run=True, stop_all_first=False)
+        elif action == "!":
+            self.use_command_slot(1, run=True, stop_all_first=False) if self.multi_command_mode else self.simple_mode_message()
+        elif action == "@":
+            self.use_command_slot(2, run=True, stop_all_first=False) if self.multi_command_mode else self.simple_mode_message()
+        elif action == "R1":
+            self.use_command_slot(1, run=True, stop_all_first=True)
+        elif action == "R2":
+            self.use_command_slot(2, run=True, stop_all_first=True)
         elif action == "x":
             thread.stop()
             self.message = f"stopped slot {slot}: {thread.name}"
@@ -1909,6 +2319,357 @@ class RunnerUi:
         save_config(config)
         self.message = f"view: {'compact' if self.compact else 'normal'}"
 
+    def settings_entries(self) -> list[tuple[str, str]]:
+        return [
+            ("compact", f"compact rows: {'on' if self.compact else 'off'}"),
+            ("multi_command_mode", f"multi-command mode: {'on' if self.multi_command_mode else 'off'}"),
+            ("show_cmd2_in_rows", f"show cmd2 in rows: {'on' if self.show_cmd2_in_rows else 'off'}"),
+            ("focus_zed_on_run", f"focus Zed before run: {'on' if self.focus_zed_on_run else 'off'}"),
+            ("trust_zed_focus", f"trust Zed DB focus polling: {'on' if self.trust_zed_focus else 'off'}"),
+            (
+                "open_threads_menu_on_focus",
+                f"generated focus opens threads menu: {'on' if bool(load_config().get('open_threads_menu_on_focus', False)) else 'off'}",
+            ),
+            ("sort_mode", f"sort mode: {self.sort_mode}"),
+            ("focus_limit", f"focus cap: {self.focus_limit}"),
+            ("leader_key", f"leader key: {self.leader_key}"),
+        ]
+
+    def settings_menu(self, stdscr: curses.window) -> None:
+        selected = 0
+        stdscr.nodelay(False)
+        try:
+            while True:
+                entries = self.settings_entries()
+                stdscr.erase()
+                height, width = stdscr.getmaxyx()
+                self.write_line(stdscr, 0, "settings: enter toggle/edit | q close", curses.A_REVERSE)
+                list_height = max(0, height - 2)
+                start = max(0, selected - max(0, list_height - 1))
+                for row, (_, label) in enumerate(entries[start : start + list_height]):
+                    index = start + row
+                    marker = ">" if index == selected else " "
+                    attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+                    self.write_line(stdscr, row + 1, f"{marker} {label}"[: max(1, width - 1)], attr)
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key in (ord("q"), 27):
+                    self.message = "settings closed"
+                    return
+                if key in (curses.KEY_UP, ord("k")):
+                    selected = max(0, selected - 1)
+                    continue
+                if key in (curses.KEY_DOWN, ord("j")):
+                    selected = min(len(entries) - 1, selected + 1)
+                    continue
+                if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                    self.apply_setting(stdscr, entries[selected][0])
+        finally:
+            stdscr.nodelay(True)
+
+    def ssh_connections_menu(self, stdscr: curses.window) -> None:
+        selected = 0
+        stdscr.nodelay(False)
+        try:
+            while True:
+                connections = load_ssh_connections()
+                entries = [
+                    f"{entry['name']} [{'run' if self.is_ssh_connection_running(str(entry['name'])) else 'idle'}]"
+                    f"{' auto' if bool(entry.get('auto_start', False)) else ''}"
+                    for entry in connections
+                ]
+                entries.append("+ add connection")
+                stdscr.erase()
+                height, width = stdscr.getmaxyx()
+                self.write_line(stdscr, 0, "ssh: enter start/stop | A auto | a add | d delete | q close", curses.A_REVERSE)
+                list_height = max(0, height - 2)
+                selected = min(selected, max(0, len(entries) - 1))
+                start = max(0, selected - max(0, list_height - 1))
+                for row, label in enumerate(entries[start : start + list_height]):
+                    index = start + row
+                    marker = ">" if index == selected else " "
+                    attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+                    self.write_line(stdscr, row + 1, f"{marker} {label}"[: max(1, width - 1)], attr)
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key in (ord("q"), 27):
+                    self.message = "ssh menu closed"
+                    return
+                if key in (curses.KEY_UP, ord("k")):
+                    selected = max(0, selected - 1)
+                    continue
+                if key in (curses.KEY_DOWN, ord("j")):
+                    selected = min(len(entries) - 1, selected + 1)
+                    continue
+                if key == ord("a") or (key in (curses.KEY_ENTER, 10, 13) and selected == len(connections)):
+                    self.add_ssh_connection(stdscr)
+                    selected = len(load_ssh_connections())
+                    continue
+                if key == ord("d") and selected < len(connections):
+                    self.delete_ssh_connection(str(connections[selected]["name"]))
+                    selected = max(0, selected - 1)
+                    continue
+                if key == ord("A") and selected < len(connections):
+                    self.toggle_ssh_auto_start(str(connections[selected]["name"]))
+                    continue
+                if key in (curses.KEY_ENTER, 10, 13) and selected < len(connections):
+                    self.toggle_ssh_connection(connections[selected])
+        finally:
+            stdscr.nodelay(True)
+
+    def add_ssh_connection(self, stdscr: curses.window) -> None:
+        first = self.read_prompt(stdscr, "ssh name or command: ", "").strip()
+        if not first:
+            self.message = "ssh add cancelled"
+            return
+        if first.startswith("ssh "):
+            command = first
+            name = ssh_connection_name_from_command(command)
+        else:
+            name = first
+            command = self.read_prompt(stdscr, "ssh command: ", "").strip()
+            if not command:
+                self.message = "ssh command empty"
+                return
+        try:
+            argv = shlex.split(command)
+        except ValueError as error:
+            self.message = f"invalid ssh command: {error}"
+            return
+        if not argv or argv[0] != "ssh":
+            self.message = "ssh command must start with ssh"
+            return
+        connections = [entry for entry in load_ssh_connections() if entry["name"] != name]
+        connections.append({"name": name, "command": command})
+        save_ssh_connections(connections)
+        self.message = f"saved ssh: {name}"
+
+    def delete_ssh_connection(self, name: str) -> None:
+        self.stop_ssh_connection(name)
+        save_ssh_connections([entry for entry in load_ssh_connections() if entry["name"] != name])
+        self.message = f"deleted ssh: {name}"
+
+    def toggle_ssh_auto_start(self, name: str) -> None:
+        connections = []
+        enabled = False
+        for entry in load_ssh_connections():
+            if entry["name"] == name:
+                entry = dict(entry)
+                enabled = not bool(entry.get("auto_start", False))
+                if enabled:
+                    entry["auto_start"] = True
+                else:
+                    entry.pop("auto_start", None)
+            connections.append(entry)
+        save_ssh_connections(connections)
+        self.message = f"ssh auto-start {name}: {'on' if enabled else 'off'}"
+
+    def toggle_ssh_connection(self, connection: dict[str, object]) -> None:
+        name = str(connection["name"])
+        if self.is_ssh_connection_running(name):
+            self.stop_ssh_connection(name)
+            self.message = f"stopped ssh: {name}"
+            return
+        self.start_ssh_connection(connection)
+
+    def start_ssh_connection(self, connection: dict[str, object], quiet: bool = False) -> bool:
+        name = str(connection["name"])
+        command = str(connection["command"])
+        try:
+            argv = ssh_connection_runtime_argv(command)
+        except ValueError as error:
+            if not quiet:
+                self.message = f"invalid ssh command {name}: {error}"
+            return False
+        if not argv or argv[0] != "ssh":
+            if not quiet:
+                self.message = f"ssh command must start with ssh: {name}"
+            return False
+        if self.is_ssh_connection_running(name):
+            if not quiet:
+                self.message = f"ssh already running: {name}"
+            return True
+        log_path = ssh_connection_log_path(name)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("ab", buffering=0) as log:
+            log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {command}\n".encode())
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    preexec_fn=os.setsid,
+                )
+            except OSError as error:
+                if not quiet:
+                    self.message = f"ssh start failed {name}: {error}"
+                return False
+        self.ssh_processes[name] = process
+        register_process_key(ssh_process_key(name), process, command, "manual")
+        if not quiet:
+            self.message = f"started ssh: {name}"
+        return True
+
+    def auto_start_ssh_connections(self) -> None:
+        started = 0
+        for connection in load_ssh_connections():
+            name = str(connection["name"])
+            if bool(connection.get("auto_start", False)) and not self.is_ssh_connection_running(name):
+                if self.start_ssh_connection(connection, quiet=True):
+                    started += 1
+        if started:
+            self.message = f"auto-started {started} ssh connection(s)"
+
+    def is_ssh_connection_running(self, name: str) -> bool:
+        process = self.ssh_processes.get(name)
+        if process is not None and process.poll() is None:
+            return True
+        data = load_processes().get(ssh_process_key(name))
+        pgid = data.get("pgid") if data else None
+        if isinstance(pgid, int) and is_pgid_alive(pgid):
+            return True
+        if data:
+            unregister_process_key(ssh_process_key(name))
+        return False
+
+    def stop_ssh_connection(self, name: str) -> None:
+        process = self.ssh_processes.pop(name, None)
+        if process is None or process.poll() is not None:
+            data = load_processes().get(ssh_process_key(name))
+            pgid = data.get("pgid") if data else None
+            if isinstance(pgid, int):
+                stop_process_group(pgid)
+            unregister_process_key(ssh_process_key(name))
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            unregister_process_key(ssh_process_key(name))
+            return
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                unregister_process_key(ssh_process_key(name))
+                return
+            time.sleep(0.05)
+        if process.poll() is None:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        unregister_process_key(ssh_process_key(name))
+
+    def stop_all_ssh_connections(self) -> None:
+        names = {str(entry["name"]) for entry in load_ssh_connections()}
+        names.update(self.ssh_processes)
+        for name in list(names):
+            self.stop_ssh_connection(name)
+
+    def ssh_connection_by_name(self, name: str) -> dict[str, object] | None:
+        for connection in load_ssh_connections():
+            if connection["name"] == name:
+                return connection
+        return None
+
+    def ensure_thread_ssh_dependency(self, thread: ThreadCommand) -> bool:
+        name = self.thread_ssh_dependencies.get(thread.key, "")
+        if not name:
+            return True
+        connection = self.ssh_connection_by_name(name)
+        if connection is None:
+            thread.last_status = "missing ssh dependency"
+            self.message = f"missing ssh dependency {name}: {thread.name}"
+            return False
+        if self.is_ssh_connection_running(name):
+            return True
+        if not self.start_ssh_connection(connection, quiet=True):
+            thread.last_status = "ssh dependency failed"
+            self.message = f"failed ssh dependency {name}: {thread.name}"
+            return False
+        return True
+
+    def set_ssh_dependency_menu(self, stdscr: curses.window) -> None:
+        connections = load_ssh_connections()
+        entries = ["<none>", *[str(entry["name"]) for entry in connections]]
+        choice = self.choose_entry(stdscr, f"ssh dependency: {self.current.name}", entries)
+        if choice is None:
+            self.message = "ssh dependency unchanged"
+            return
+        if choice == "<none>":
+            self.thread_ssh_dependencies = set_thread_ssh_dependency(self.current.key, None)
+            self.message = f"cleared ssh dependency: {self.current.name}"
+            return
+        self.thread_ssh_dependencies = set_thread_ssh_dependency(self.current.key, choice)
+        self.message = f"ssh dependency {self.current.name}: {choice}"
+
+    def apply_setting(self, stdscr: curses.window, setting: str) -> None:
+        config = load_config()
+        if setting == "compact":
+            self.compact = not self.compact
+            config["compact"] = self.compact
+            save_config(config)
+            self.message = f"compact: {'on' if self.compact else 'off'}"
+            return
+        if setting == "focus_zed_on_run":
+            self.focus_zed_on_run = not self.focus_zed_on_run
+            config["focus_zed_on_run"] = self.focus_zed_on_run
+            save_config(config)
+            self.message = f"focus Zed before run: {'on' if self.focus_zed_on_run else 'off'}"
+            return
+        if setting == "multi_command_mode":
+            self.multi_command_mode = not self.multi_command_mode
+            config["multi_command_mode"] = self.multi_command_mode
+            if not self.multi_command_mode:
+                self.pending_row_action = ""
+            save_config(config)
+            self.message = f"multi-command mode: {'on' if self.multi_command_mode else 'off'}"
+            return
+        if setting == "show_cmd2_in_rows":
+            self.show_cmd2_in_rows = not self.show_cmd2_in_rows
+            config["show_cmd2_in_rows"] = self.show_cmd2_in_rows
+            save_config(config)
+            self.message = f"show cmd2 in rows: {'on' if self.show_cmd2_in_rows else 'off'}"
+            return
+        if setting == "trust_zed_focus":
+            self.trust_zed_focus = not self.trust_zed_focus
+            config["trust_zed_focus"] = self.trust_zed_focus
+            save_config(config)
+            self.message = f"trust Zed focus: {'on' if self.trust_zed_focus else 'off'}"
+            return
+        if setting == "open_threads_menu_on_focus":
+            enabled = not bool(config.get("open_threads_menu_on_focus", False))
+            set_open_threads_menu_on_focus(enabled)
+            self.message = f"focus keybinding opens threads menu: {'on' if enabled else 'off'}"
+            return
+        if setting == "sort_mode":
+            self.cycle_sort()
+            return
+        if setting == "focus_limit":
+            raw = self.read_prompt(stdscr, "focus cap: ", str(self.focus_limit))
+            try:
+                value = max(1, int(raw))
+            except ValueError:
+                self.message = "focus cap must be a positive integer"
+                return
+            self.focus_limit = value
+            config["focus_limit"] = value
+            save_config(config)
+            self.message = f"focus cap: {value}"
+            return
+        if setting == "leader_key":
+            value = self.read_prompt(stdscr, "leader key (space or single char): ", self.leader_key).strip()
+            if not value:
+                self.message = "leader key unchanged"
+                return
+            if value not in ("space", "Space", "<space>", "<leader>") and len(value) != 1:
+                self.message = "leader key must be 'space' or one character"
+                return
+            self.leader_key = value
+            config["leader_key"] = value
+            save_config(config)
+            self.message = f"leader key: {value}"
+
     def set_filter(self, stdscr: curses.window) -> None:
         self.filter_query = self.read_prompt(stdscr, "filter: ", self.filter_query)
         visible = self.visible_indices(self.cached_focused_project(), self.cached_ai_states())
@@ -1923,6 +2684,27 @@ class RunnerUi:
             self.persist_current()
             record_command_history(self.current.key, command)
             self.message = f"set {self.current.name}: {command}"
+
+    def edit_command_slot(self, stdscr: curses.window, slot: int) -> None:
+        slots = command_slot_state(self.current.key, self.command_slots)
+        initial = slots.get(f"cmd{slot}", "")
+        command = self.read_history_prompt(
+            stdscr,
+            f"cmd{slot} for {self.current.name}: ",
+            initial,
+            load_command_history().get(self.current.key, []),
+            self.command_completions(self.current),
+        )
+        if not command:
+            return
+        active_before = active_command_slot(self.current.key, self.current.command, self.command_slots)
+        state = save_thread_command_slot(self.current.key, slot, command, active=False)
+        self.command_slots[self.current.key] = state
+        if active_before == str(slot):
+            self.current.command = command
+            self.persist_current(active_slot=str(slot))
+        record_command_history(self.current.key, command)
+        self.message = f"set cmd{slot} {self.current.name}: {command}"
 
     def add_project(self, stdscr: curses.window) -> None:
         raw_path = self.read_prompt(stdscr, "project path: ", "")
@@ -2034,6 +2816,31 @@ class RunnerUi:
         record_command_history(self.current.key, command)
         self.message = f"history set {self.current.name}: {command}"
 
+    def use_command_slot(self, slot: int, run: bool, stop_all_first: bool = False) -> None:
+        command = command_for_slot(self.current.key, slot, self.command_slots)
+        if not command:
+            self.message = f"cmd{slot} empty for {self.current.name}"
+            return
+        self.current.command = command
+        self.persist_current(active_slot=str(slot))
+        if run:
+            self.start_current(stop_all_first=stop_all_first, command_slot=str(slot))
+            return
+        self.message = f"active cmd{slot}: {self.current.name}"
+
+    def save_current_command_slot(self, stdscr: curses.window) -> None:
+        if not self.current.command.strip():
+            self.message = "set a command before saving cmd1/cmd2"
+            return
+        slot_raw = self.read_prompt(stdscr, "save current command to cmd slot (1/2): ", "1")
+        if slot_raw not in ("1", "2"):
+            self.message = "command slot must be 1 or 2"
+            return
+        slot = int(slot_raw)
+        state = save_thread_command_slot(self.current.key, slot, self.current.command, active=False)
+        self.command_slots[self.current.key] = state
+        self.message = f"saved cmd{slot}: {self.current.name}"
+
     def save_preset(self, stdscr: curses.window) -> None:
         if not self.current.command.strip():
             self.message = "set a command before saving a preset"
@@ -2056,14 +2863,25 @@ class RunnerUi:
         aliases = load_aliases()
         remote_focus = load_remote_focus_targets()
         remote_nix = load_remote_nix_cache()
+        processes = load_processes()
+        process_data = processes.get(thread.key, {})
         history_count = len(load_command_history().get(thread.key, []))
+        slots = command_slot_state(thread.key, self.command_slots)
+        dependency = self.thread_ssh_dependencies.get(thread.key, "-")
+        dependency_state = "run" if dependency != "-" and self.is_ssh_connection_running(dependency) else "idle"
         details = [
             f"name: {thread.name}",
             f"base: {thread.base_name}",
             f"key: {thread.key}",
             f"alias: {aliases.get(thread.key, '-')}",
             f"command: {thread.command or '<empty>'}",
+            f"active slot: {self.command_slot_label(thread)}",
+            f"running slot: {thread.running_slot}",
+            f"cmd1: {slots.get('cmd1') or '<empty>'}",
+            f"cmd2: {slots.get('cmd2') or '<empty>'}",
             f"status: {thread.last_status}",
+            f"pid/pgid: {process_data.get('pid', thread.registered_pid or '-')} / {process_data.get('pgid', thread.registered_pgid or '-')}",
+            f"ssh dependency: {dependency} ({dependency_state if dependency != '-' else '-'})",
             f"history: {history_count} command(s)",
             f"log: {thread.log_path}",
         ]
@@ -2079,7 +2897,15 @@ class RunnerUi:
         else:
             details.append(f"project: {thread.project}")
             details.append(f"nix: {nix_wrapper_kind(thread.project)}")
+        details.extend(f"log tail: {line}" for line in self.thread_log_preview(thread, 3))
         return details
+
+    def thread_log_preview(self, thread: ThreadCommand, line_count: int) -> list[str]:
+        try:
+            lines = thread.log_path.read_text(errors="replace").splitlines()
+        except OSError:
+            return ["<no log yet>"]
+        return lines[-line_count:] if lines else ["<empty log>"]
 
     def mark_ai_seen(self, thread: ThreadCommand) -> None:
         state = self.cached_ai_states().get(thread.key)
@@ -2140,13 +2966,19 @@ class RunnerUi:
         history = load_command_history().get(thread.key, [])
         if thread.command and thread.command not in history:
             history = [thread.command, *history]
+        prompt = f"command for {thread.name}: "
+        return self.read_history_prompt(stdscr, prompt, thread.command, history, self.command_completions(thread))
+
+    def command_completions(self, thread: ThreadCommand) -> list[str]:
+        history = load_command_history().get(thread.key, [])
+        slots = command_slot_state(thread.key, self.command_slots)
+        slot_commands = [slots.get("cmd1", ""), slots.get("cmd2", "")]
         preset_commands = sorted(set(self.presets.get(thread.key, {}).values()))
         completions = []
-        for command in [*history, *preset_commands]:
+        for command in [*slot_commands, thread.command, *history, *preset_commands]:
             if command and command not in completions:
                 completions.append(command)
-        prompt = f"command for {thread.name}: "
-        return self.read_history_prompt(stdscr, prompt, thread.command, history, completions)
+        return completions
 
     def read_history_prompt(
         self,
@@ -2268,9 +3100,106 @@ class RunnerUi:
         finally:
             stdscr.nodelay(True)
 
-    def persist_current(self) -> None:
+    def process_dashboard_entries(self) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        for key, data in sorted(load_processes().items()):
+            pgid = data.get("pgid")
+            pid = data.get("pid")
+            slot = data.get("command_slot", "manual")
+            status = "run" if isinstance(pgid, int) and is_pgid_alive(pgid) else "stale"
+            kind = "ssh" if key.startswith("ssh-connection:") else "cmd"
+            command = display_text(str(data.get("command", "")))[:48]
+            entries.append((f"{kind:<5} {status:<5} pid={pid or '-'} pgid={pgid or '-'} slot={slot} {key} {command}", key))
+        for thread in self.threads:
+            if thread.warm_process is not None and thread.warm_process.poll() is None:
+                entries.append((f"warm  run   pid={thread.warm_process.pid} pgid=- slot=- {thread.key}", f"warm:{thread.key}"))
+        for key, process in sorted(self.rider_processes.items()):
+            if process.poll() is None:
+                entries.append((f"rider run   pid={process.pid} pgid=- slot=- {key}", f"rider:{key}"))
+        return entries
+
+    def process_dashboard(self, stdscr: curses.window) -> None:
+        selected = 0
+        stdscr.nodelay(False)
+        try:
+            while True:
+                entries = self.process_dashboard_entries()
+                stdscr.erase()
+                height, width = stdscr.getmaxyx()
+                self.write_line(stdscr, 0, "processes: enter stop | r refresh | q close", curses.A_REVERSE)
+                if not entries:
+                    self.write_line(stdscr, 1, "no tracked processes")
+                    stdscr.refresh()
+                    key = stdscr.getch()
+                    if key in (ord("q"), 27, curses.KEY_ENTER, 10, 13):
+                        self.message = "process dashboard closed"
+                        return
+                    continue
+                selected = min(selected, len(entries) - 1)
+                list_height = max(0, height - 2)
+                start = max(0, selected - max(0, list_height - 1))
+                for row, (label, _) in enumerate(entries[start : start + list_height]):
+                    index = start + row
+                    marker = ">" if index == selected else " "
+                    attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+                    self.write_line(stdscr, row + 1, f"{marker} {label}"[: max(1, width - 1)], attr)
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key in (ord("q"), 27):
+                    self.message = "process dashboard closed"
+                    return
+                if key in (curses.KEY_UP, ord("k")):
+                    selected = max(0, selected - 1)
+                    continue
+                if key in (curses.KEY_DOWN, ord("j")):
+                    selected = min(len(entries) - 1, selected + 1)
+                    continue
+                if key == ord("r"):
+                    continue
+                if key in (curses.KEY_ENTER, 10, 13):
+                    self.stop_process_entry(entries[selected][1])
+                    entries = self.process_dashboard_entries()
+                    selected = min(selected, max(0, len(entries) - 1))
+        finally:
+            stdscr.nodelay(True)
+
+    def stop_process_entry(self, key: str) -> None:
+        if key.startswith("ssh-connection:"):
+            name = key.removeprefix("ssh-connection:")
+            self.stop_ssh_connection(name)
+            self.message = f"stopped ssh: {name}"
+            return
+        if key.startswith("warm:"):
+            thread_key = key.removeprefix("warm:")
+            thread = next((item for item in self.threads if item.key == thread_key), None)
+            if thread is not None:
+                thread.stop_warm()
+            self.message = f"stopped warm: {thread_key}"
+            return
+        if key.startswith("rider:"):
+            rider_key = key.removeprefix("rider:")
+            self.stop_rider_process(rider_key)
+            self.message = f"stopped rider: {rider_key}"
+            return
+        thread = next((item for item in self.threads if item.key == key), None)
+        if thread is not None:
+            thread.stop()
+            self.message = f"stopped process: {thread.name}"
+            return
+        data = load_processes().get(key)
+        pgid = data.get("pgid") if data else None
+        if isinstance(pgid, int):
+            stop_process_group(pgid)
+        unregister_process_key(key)
+        self.message = f"stopped process: {key}"
+
+    def persist_current(self, active_slot: str | None = None) -> None:
         self.commands[self.current.key] = self.current.command
         save_commands(self.commands)
+        if active_slot is None:
+            active_slot = active_command_slot(self.current.key, self.current.command, self.command_slots)
+        state = set_active_command_slot(self.current.key, active_slot)
+        self.command_slots[self.current.key] = state
 
     def focus_current(self) -> None:
         if self.current.is_remote:
@@ -2287,10 +3216,55 @@ class RunnerUi:
         self.auto_mark_focused_ai_seen(self.current.project, self.cached_ai_states())
         self.message = message
 
-    def start_current(self, stop_all_first: bool) -> None:
+    def focus_current_rider(self) -> None:
+        thread = self.current
+        self.stop_unfocused_rider_processes(thread.key)
+        if thread.is_remote:
+            self.message = f"rider focus only supports local threads: {thread.name}"
+            return
+        existing = self.rider_processes.get(thread.key)
+        if existing is not None and existing.poll() is None:
+            self.message = f"rider already focused: {thread.name}"
+            return
+        process, message = focus_project_in_rider(thread.project)
+        if process is not None:
+            self.rider_processes[thread.key] = process
+        self.message = message
+
+    def stop_unfocused_rider_processes(self, focused_key: str) -> None:
+        for key in list(self.rider_processes):
+            if key != focused_key:
+                self.stop_rider_process(key)
+
+    def stop_all_rider_processes(self) -> None:
+        for key in list(self.rider_processes):
+            self.stop_rider_process(key)
+
+    def stop_rider_process(self, key: str) -> None:
+        process = self.rider_processes.pop(key, None)
+        if process is None or process.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                return
+            time.sleep(0.05)
+        if process.poll() is None:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def start_current(self, stop_all_first: bool, command_slot: str = "manual") -> None:
         thread = self.current
         if stop_all_first:
             self.stop_all()
+        if not self.ensure_thread_ssh_dependency(thread):
+            return
         if self.focus_zed_on_run:
             if thread.is_remote:
                 ok, message = focus_remote_in_zed(str(thread.remote_host), str(thread.remote_path))
@@ -2305,9 +3279,12 @@ class RunnerUi:
                 self.focused_project_checked_at = time.monotonic()
                 self.auto_mark_focused_ai_seen(thread.project, self.cached_ai_states())
                 self.message = message
-        thread.start()
+        thread.start(command_slot=command_slot)
         self.commands[thread.key] = thread.command
         save_commands(self.commands)
+        active_slot = command_slot if command_slot in ("1", "2") else active_command_slot(thread.key, thread.command, self.command_slots)
+        state = set_active_command_slot(thread.key, active_slot)
+        self.command_slots[thread.key] = state
         record_command_history(thread.key, thread.command)
         prefix = "stopped all, " if stop_all_first else ""
         self.message = f"{prefix}running {thread.name}"
@@ -2317,11 +3294,16 @@ class RunnerUi:
             thread.stop()
         stop_all_registered_processes()
 
+    def stop_warm_processes(self) -> None:
+        for thread in self.threads:
+            thread.stop_warm()
+
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     config = load_config()
     default_focus_limit = int(config.get("focus_limit", MAX_FOCUSED_WORKTREES))
     default_sort_mode = str(config.get("sort_mode", "source"))
+    default_focus_zed_on_run = bool(config.get("focus_zed_on_run", False))
     parser = argparse.ArgumentParser(description="Run per-worktree commands through nix shells.")
     parser.add_argument("projects", nargs="*", help="Project/worktree directories. Defaults to git worktrees or cwd.")
     parser.add_argument("--command", "-c", help="Initial command for projects without a saved command.")
@@ -2329,6 +3311,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--focus-zed-on-run",
         action="store_true",
+        default=default_focus_zed_on_run,
         help="Run 'zed --existing <project>' before starting a selected thread command.",
     )
     parser.add_argument(
@@ -2353,6 +3336,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         metavar="ID",
         help="Run the saved/default command for numeric slot ID.",
+    )
+    parser.add_argument(
+        "--cmd-slot",
+        type=int,
+        choices=(1, 2),
+        help="With --run-id, run cmd1 or cmd2 for that numeric slot.",
     )
     parser.add_argument(
         "--stop-id",
@@ -2538,6 +3527,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="List command presets for PROJECT.",
     )
     parser.add_argument(
+        "--set-cmd-slot",
+        nargs=3,
+        metavar=("KEY", "SLOT", "COMMAND"),
+        help="Save cmd1 or cmd2 for a local project path or ssh:host:/path thread key.",
+    )
+    parser.add_argument(
+        "--list-cmd-slots",
+        metavar="KEY",
+        help="List cmd1/cmd2 for a local project path or ssh:host:/path thread key.",
+    )
+    parser.add_argument(
         "--sort-mode",
         choices=SORT_MODES,
         default=default_sort_mode if default_sort_mode in SORT_MODES else "source",
@@ -2559,6 +3559,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Print the runner config path and exit.",
     )
     parser.add_argument(
+        "--focus-opens-threads-menu",
+        action="store_true",
+        help="Persist generated Zed focus keybindings as focus plus Agent thread switcher.",
+    )
+    parser.add_argument(
+        "--focus-only",
+        action="store_true",
+        help="Persist generated Zed focus keybindings as focus-only.",
+    )
+    parser.add_argument(
         "--install-zed-config",
         action="store_true",
         help="Install this repo's Zed tasks into ~/.config/zed/tasks.json and print keybinding hints.",
@@ -2578,8 +3588,7 @@ def build_threads(projects: list[Path], default_command: str | None) -> list[Thr
     aliases = load_aliases()
     threads: list[ThreadCommand] = []
     for project in projects:
-        saved_command = commands.get(str(project), "")
-        command = saved_command or default_command or ""
+        command = effective_command_for_key(str(project), default_command, commands)
         thread = ThreadCommand(project=project, command=command, alias=aliases.get(str(project)))
         process_data = processes.get(str(project))
         if process_data:
@@ -2590,6 +3599,7 @@ def build_threads(projects: list[Path], default_command: str | None) -> list[Thr
                 thread.registered_pgid = pgid
                 thread.registered_pid = pid if isinstance(pid, int) else None
                 thread.command = command
+                thread.running_slot = str(process_data.get("command_slot", "manual"))
                 thread.last_status = "running"
             else:
                 unregister_process(project)
@@ -2609,7 +3619,7 @@ def build_remote_threads(default_command: str | None) -> list[ThreadCommand]:
         key = remote_thread_key(host, remote_path)
         if key in hidden:
             continue
-        command = commands.get(key, "") or default_command or ""
+        command = effective_command_for_key(key, default_command, commands)
         thread = ThreadCommand(
             project=Path(remote_path),
             command=command,
@@ -2627,6 +3637,7 @@ def build_remote_threads(default_command: str | None) -> list[ThreadCommand]:
                 thread.registered_pgid = pgid
                 thread.registered_pid = pid if isinstance(pid, int) else None
                 thread.command = command
+                thread.running_slot = str(process_data.get("command_slot", "manual"))
                 thread.last_status = "running"
             else:
                 unregister_process_key(key)
@@ -2647,7 +3658,7 @@ def thread_for_key(key: str, default_command: str | None) -> ThreadCommand | Non
         if parts is None:
             return None
         host, remote_path = parts
-        command = load_commands().get(key, "") or default_command or ""
+        command = effective_command_for_key(key, default_command)
         return ThreadCommand(
             project=Path(remote_path),
             command=command,
@@ -2661,7 +3672,7 @@ def thread_for_key(key: str, default_command: str | None) -> ThreadCommand | Non
     return thread_for_project(project, default_command)
 
 
-def run_project(project: Path, command: str | None, focus_zed: bool, stop_all_first: bool, focus_limit: int) -> int:
+def run_project(project: Path, command: str | None, focus_zed: bool, stop_all_first: bool, focus_limit: int, command_slot: str = "manual") -> int:
     project = project.expanduser().resolve()
     if stop_all_first:
         stop_all_registered_processes()
@@ -2669,21 +3680,35 @@ def run_project(project: Path, command: str | None, focus_zed: bool, stop_all_fi
     if focus_zed:
         message, _ = focus_project_in_zed(project, focus_limit=focus_limit)
         print(message)
-    thread.start()
+    thread.start(command_slot=command_slot)
     if thread.process is None:
         print(thread.last_status, file=sys.stderr)
         return 1
+    commands = load_commands()
+    commands[thread.key] = thread.command
+    save_commands(commands)
+    set_active_command_slot(thread.key, command_slot if command_slot in ("1", "2") else active_command_slot(thread.key, thread.command))
+    record_command_history(thread.key, thread.command)
     print(f"running {project}: pid {thread.process.pid}")
     return 0
 
 
-def run_slot(slot: int, command: str | None, focus_zed: bool, stop_all_first: bool, focus_limit: int) -> int:
+def run_slot(slot: int, command: str | None, focus_zed: bool, stop_all_first: bool, focus_limit: int, command_slot: int | None = None) -> int:
     key = key_for_slot(slot)
     if key is None:
         print(f"no project assigned to slot {slot}", file=sys.stderr)
         return 1
+    if command_slot is not None:
+        command = command_for_slot(key, command_slot)
+        if not command:
+            print(f"cmd{command_slot} empty for slot {slot}", file=sys.stderr)
+            return 1
+        commands = load_commands()
+        commands[key] = command
+        save_commands(commands)
+        set_active_command_slot(key, command_slot)
     if not key.startswith("ssh:"):
-        return run_project(Path(key), command, focus_zed=focus_zed, stop_all_first=stop_all_first, focus_limit=focus_limit)
+        return run_project(Path(key), command, focus_zed=focus_zed, stop_all_first=stop_all_first, focus_limit=focus_limit, command_slot=str(command_slot) if command_slot else "manual")
     if stop_all_first:
         stop_all_registered_processes()
     thread = thread_for_key(key, command)
@@ -2693,10 +3718,16 @@ def run_slot(slot: int, command: str | None, focus_zed: bool, stop_all_first: bo
     if focus_zed:
         ok, message = focus_remote_in_zed(str(thread.remote_host), str(thread.remote_path))
         print(message, file=sys.stdout if ok else sys.stderr)
-    thread.start()
+    thread.start(command_slot=str(command_slot) if command_slot else "manual")
     if thread.process is None:
         print(thread.last_status, file=sys.stderr)
         return 1
+    commands = load_commands()
+    commands[thread.key] = thread.command
+    save_commands(commands)
+    active_slot = str(command_slot) if command_slot else active_command_slot(thread.key, thread.command)
+    set_active_command_slot(thread.key, active_slot)
+    record_command_history(thread.key, thread.command)
     print(f"running {thread.key}: pid {thread.process.pid}")
     return 0
 
@@ -2832,6 +3863,26 @@ def zed_tasks(repo: Path, slot_count: int = DEFAULT_SLOT_COUNT) -> list[dict[str
                     "hide": "on_success",
                 },
                 {
+                    "label": f"thread runner: stop all then run {slot} cmd1",
+                    "command": "nix",
+                    "args": ["run", runner_ref, "--", "--stop-all-first", "--focus-zed-on-run", "--run-id", str(slot), "--cmd-slot", "1"],
+                    "cwd": "$ZED_WORKTREE_ROOT",
+                    "use_new_terminal": False,
+                    "allow_concurrent_runs": True,
+                    "reveal": "no_focus",
+                    "hide": "on_success",
+                },
+                {
+                    "label": f"thread runner: stop all then run {slot} cmd2",
+                    "command": "nix",
+                    "args": ["run", runner_ref, "--", "--stop-all-first", "--focus-zed-on-run", "--run-id", str(slot), "--cmd-slot", "2"],
+                    "cwd": "$ZED_WORKTREE_ROOT",
+                    "use_new_terminal": False,
+                    "allow_concurrent_runs": True,
+                    "reveal": "no_focus",
+                    "hide": "on_success",
+                },
+                {
                     "label": f"thread runner: stop {slot}",
                     "command": "nix",
                     "args": ["run", runner_ref, "--", "--stop-id", str(slot)],
@@ -2846,12 +3897,17 @@ def zed_tasks(repo: Path, slot_count: int = DEFAULT_SLOT_COUNT) -> list[dict[str
     return tasks
 
 
-def print_keymap_hints(slot_count: int) -> None:
+def print_keymap_hints(slot_count: int, open_threads_menu: bool) -> None:
     print("keymap hints:")
+    mode = "focus + threads menu" if open_threads_menu else "focus only"
+    print(f"focus binding mode: {mode}")
     print('{ "context": "Workspace", "bindings": {')
     for slot in range(1, slot_count + 1):
-        print(f'  "space f {slot}": ["task::Spawn", {{ "task_name": "thread runner: focus {slot}" }}],')
+        focus_binding = json.dumps(zed_focus_binding(f"thread runner: focus {slot}", open_threads_menu))
+        print(f'  "space f {slot}": {focus_binding},')
         print(f'  "space r {slot}": ["task::Spawn", {{ "task_name": "thread runner: stop all then run {slot}" }}],')
+        print(f'  "space r {slot} 1": ["task::Spawn", {{ "task_name": "thread runner: stop all then run {slot} cmd1" }}],')
+        print(f'  "space r {slot} 2": ["task::Spawn", {{ "task_name": "thread runner: stop all then run {slot} cmd2" }}],')
         print(f'  "space x {slot}": ["task::Spawn", {{ "task_name": "thread runner: stop {slot}" }}],')
     print("} }")
 
@@ -2864,7 +3920,7 @@ def install_zed_config(slot_count: int) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(zed_tasks(repo, slot_count=slot_count), indent=2) + "\n")
     print(f"installed tasks: {target}")
-    print_keymap_hints(slot_count)
+    print_keymap_hints(slot_count, bool(load_config().get("open_threads_menu_on_focus", False)))
 
 
 def main(argv: list[str]) -> int:
@@ -2873,6 +3929,12 @@ def main(argv: list[str]) -> int:
 
     if args.config_path:
         print(config_dir() / "config.json")
+        return 0
+
+    if args.focus_opens_threads_menu or args.focus_only:
+        config = set_open_threads_menu_on_focus(args.focus_opens_threads_menu and not args.focus_only)
+        mode = "focus + threads menu" if config.get("open_threads_menu_on_focus") else "focus only"
+        print(f"focus binding mode: {mode}")
         return 0
 
     if args.compact or args.normal:
@@ -2908,6 +3970,7 @@ def main(argv: list[str]) -> int:
             focus_zed=args.focus_zed_on_run,
             stop_all_first=args.stop_all_first or args.stop_all,
             focus_limit=args.focus_limit,
+            command_slot=args.cmd_slot,
         )
 
     if args.add_project:
@@ -3021,6 +4084,27 @@ def main(argv: list[str]) -> int:
             print(project)
         return 0
 
+    if args.set_cmd_slot:
+        key_raw, slot_raw, command = args.set_cmd_slot
+        if slot_raw not in ("1", "2"):
+            print("command slot must be 1 or 2", file=sys.stderr)
+            return 1
+        key = normalize_thread_key(key_raw)
+        state = save_thread_command_slot(key, int(slot_raw), command, active=True)
+        commands = load_commands()
+        commands[key] = command.strip()
+        save_commands(commands)
+        for name in ("cmd1", "cmd2", "active"):
+            print(f"{name}: {state.get(name, '')}")
+        return 0
+
+    if args.list_cmd_slots:
+        key = normalize_thread_key(args.list_cmd_slots)
+        state = command_slot_state(key)
+        for name in ("cmd1", "cmd2", "active"):
+            print(f"{name}: {state.get(name, '')}")
+        return 0
+
     if args.set_preset:
         project_raw, name, command = args.set_preset
         presets = set_preset(Path(project_raw), name, command)
@@ -3079,18 +4163,18 @@ def main(argv: list[str]) -> int:
         for thread in threads:
             thread.warm()
 
+    ui = RunnerUi(
+        threads,
+        focus_zed_on_run=args.focus_zed_on_run,
+        focus_limit=args.focus_limit,
+        sort_mode=args.sort_mode,
+    )
     try:
-        curses.wrapper(
-            RunnerUi(
-                threads,
-                focus_zed_on_run=args.focus_zed_on_run,
-                focus_limit=args.focus_limit,
-                sort_mode=args.sort_mode,
-            ).run
-        )
+        curses.wrapper(ui.run)
     except KeyboardInterrupt:
         for thread in threads:
             thread.stop()
+        ui.stop_all_rider_processes()
     return 0
 
 

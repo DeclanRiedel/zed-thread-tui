@@ -136,6 +136,331 @@ class RunnerStateTests(unittest.TestCase):
         self.assertIn("!", row)
         self.assertLess(len(row), 52)
 
+    def test_row_command_uses_cmd1_and_optional_cmd2(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        RUNNER.save_thread_command_slot(str(project), 1, "nix run .#dev")
+        RUNNER.save_thread_command_slot(str(project), 2, "nix run .#test")
+        thread = RUNNER.ThreadCommand(project=project, command="manual")
+        ui = RUNNER.RunnerUi([thread], False, 4, "source")
+
+        self.assertEqual(ui.row_command_text(thread), "nix run .#dev")
+        ui.apply_setting(None, "multi_command_mode")
+        ui.apply_setting(None, "show_cmd2_in_rows")
+        self.assertEqual(ui.row_command_text(thread), "nix run .#dev  nix run .#test")
+        ui.use_command_slot(2, run=False)
+        self.assertEqual(ui.row_command_text(thread), "nix run .#dev  [nix run .#test]")
+
+        empty = RUNNER.ThreadCommand(project=project / "empty", command="")
+        ui = RUNNER.RunnerUi([empty], False, 4, "source")
+        ui.multi_command_mode = True
+        ui.show_cmd2_in_rows = True
+        self.assertEqual(ui.row_command_text(empty), "<cmd>  <cmd2>")
+
+    def test_command_slots_persist_active_and_complete(self) -> None:
+        key = "ssh:devbox:/srv/project"
+
+        state = RUNNER.save_thread_command_slot(key, 1, "nix run .#dev")
+        state = RUNNER.save_thread_command_slot(key, 2, "nix run .#test")
+        RUNNER.save_commands({key: "manual"})
+
+        self.assertEqual(state["cmd1"], "nix run .#dev")
+        self.assertEqual(state["cmd2"], "nix run .#test")
+        self.assertEqual(state["active"], "manual")
+        self.assertEqual(RUNNER.command_for_slot(key, 1), "nix run .#dev")
+        self.assertEqual(RUNNER.effective_command_for_key(key, None), "nix run .#dev")
+        self.assertEqual(RUNNER.active_command_slot(key, "nix run .#dev"), "1")
+        self.assertEqual(RUNNER.active_command_slot(key, "nix develop"), "manual")
+        self.assertEqual(RUNNER.complete_command_value("nix run .#d", [state["cmd1"], state["cmd2"]]), "nix run .#dev")
+
+    def test_leader_two_phase_runs_command_slot(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        thread = RUNNER.ThreadCommand(project=project, command="")
+        RUNNER.save_thread_command_slot(str(project), 1, "nix run .#dev")
+        RUNNER.save_thread_command_slot(str(project), 2, "nix run .#test")
+        ui = RUNNER.RunnerUi([thread], False, 4, "source")
+        ui.multi_command_mode = True
+        ui.slots = {str(project): 9}
+        calls = []
+
+        def fake_start(stop_all_first: bool, command_slot: str = "manual") -> None:
+            calls.append((ui.current.command, stop_all_first, command_slot))
+
+        ui.start_current = fake_start
+
+        ui.leader_active = True
+        ui.handle_leader_key(None, ord("9"))
+        ui.handle_leader_key(None, ord("R"))
+        ui.handle_leader_key(None, ord("2"))
+
+        self.assertEqual(calls, [("nix run .#test", True, "2")])
+        self.assertFalse(ui.leader_active)
+        self.assertEqual(ui.leader_pending_action, "")
+        self.assertEqual(RUNNER.load_commands()[str(project)], "nix run .#test")
+
+    def test_leader_two_phase_start_and_edit_command_slot(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        thread = RUNNER.ThreadCommand(project=project, command="")
+        RUNNER.save_thread_command_slot(str(project), 1, "nix run .#dev")
+        RUNNER.save_thread_command_slot(str(project), 2, "nix run .#test")
+        ui = RUNNER.RunnerUi([thread], False, 4, "source")
+        ui.multi_command_mode = True
+        ui.slots = {str(project): 9}
+        calls = []
+        edited = []
+
+        def fake_start(stop_all_first: bool, command_slot: str = "manual") -> None:
+            calls.append((ui.current.command, stop_all_first, command_slot))
+
+        def fake_edit(stdscr, slot: int) -> None:
+            edited.append(slot)
+
+        ui.start_current = fake_start
+        ui.edit_command_slot = fake_edit
+
+        ui.leader_active = True
+        ui.handle_leader_key(None, ord("9"))
+        ui.handle_leader_key(None, ord("s"))
+        ui.handle_leader_key(None, ord("1"))
+        ui.leader_active = True
+        ui.handle_leader_key(None, ord("9"))
+        ui.handle_leader_key(None, ord("e"))
+        ui.handle_leader_key(None, ord("2"))
+
+        self.assertEqual(calls, [("nix run .#dev", False, "1")])
+        self.assertEqual(edited, [2])
+
+    def test_selected_row_pending_start_and_edit_require_multi_command_mode(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        thread = RUNNER.ThreadCommand(project=project, command="")
+        RUNNER.save_thread_command_slot(str(project), 1, "nix run .#dev")
+        ui = RUNNER.RunnerUi([thread], False, 4, "source")
+        calls = []
+        edited = []
+
+        def fake_start(stop_all_first: bool, command_slot: str = "manual") -> None:
+            calls.append((ui.current.command, command_slot))
+
+        def fake_edit(stdscr, slot: int) -> None:
+            edited.append(slot)
+
+        ui.start_current = fake_start
+        ui.edit_command_slot = fake_edit
+        ui.handle_key(None, ord("s"))
+
+        self.assertEqual(calls, [("", "manual")])
+
+        ui.multi_command_mode = True
+        ui.handle_key(None, ord("s"))
+        ui.handle_key(None, ord("1"))
+        ui.handle_key(None, ord("e"))
+        ui.handle_key(None, ord("1"))
+
+        self.assertEqual(calls[-1], ("nix run .#dev", "1"))
+        self.assertEqual(edited, [1])
+
+    def test_process_registry_records_command_slot(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+
+        class FakeProcess:
+            pid = 12345
+
+        original_getpgid = RUNNER.os.getpgid
+        RUNNER.os.getpgid = lambda pid: 54321
+        try:
+            RUNNER.register_process(project, FakeProcess(), "nix run .#dev", "1")
+        finally:
+            RUNNER.os.getpgid = original_getpgid
+
+        self.assertEqual(RUNNER.load_processes()[str(project)]["command_slot"], "1")
+
+    def test_stop_all_registered_processes_keeps_ssh_connections(self) -> None:
+        RUNNER.save_processes(
+            {
+                "ssh-connection:tunnel": {"pid": 1, "pgid": 111, "command": "ssh -N devbox", "command_slot": "manual"},
+                "project": {"pid": 2, "pgid": 222, "command": "sleep 5", "command_slot": "manual"},
+            }
+        )
+        stopped = []
+        original_stop = RUNNER.stop_process_group
+        RUNNER.stop_process_group = lambda pgid: stopped.append(pgid)
+        try:
+            count = RUNNER.stop_all_registered_processes()
+        finally:
+            RUNNER.stop_process_group = original_stop
+
+        self.assertEqual(count, 1)
+        self.assertEqual(stopped, [222])
+        self.assertIn("ssh-connection:tunnel", RUNNER.load_processes())
+
+    def test_run_slot_can_use_command_slot(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        RUNNER.save_slots({str(project): 7})
+        RUNNER.save_thread_command_slot(str(project), 1, "nix run .#dev")
+        calls = []
+        original_run_project = RUNNER.run_project
+
+        def fake_run_project(project_arg, command, focus_zed, stop_all_first, focus_limit, command_slot="manual"):
+            calls.append((project_arg, command, focus_zed, stop_all_first, focus_limit, command_slot))
+            return 0
+
+        RUNNER.run_project = fake_run_project
+        try:
+            result = RUNNER.run_slot(7, None, focus_zed=True, stop_all_first=True, focus_limit=4, command_slot=1)
+        finally:
+            RUNNER.run_project = original_run_project
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [(project, "nix run .#dev", True, True, 4, "1")])
+        self.assertEqual(RUNNER.load_commands()[str(project)], "nix run .#dev")
+
+    def test_zed_focus_binding_can_include_threads_menu(self) -> None:
+        focus_only = RUNNER.zed_focus_binding("thread runner: focus 9", False)
+        focus_menu = RUNNER.zed_focus_binding("thread runner: focus 9", True)
+
+        self.assertEqual(focus_only, ["task::Spawn", {"task_name": "thread runner: focus 9"}])
+        self.assertEqual(focus_menu[0], "action::Sequence")
+        self.assertIn("agents_sidebar::ToggleThreadSwitcher", focus_menu[1])
+
+    def test_settings_apply_persists_toggles(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        ui = RUNNER.RunnerUi([RUNNER.ThreadCommand(project=project, command="")], False, 4, "source")
+
+        ui.apply_setting(None, "focus_zed_on_run")
+        ui.apply_setting(None, "multi_command_mode")
+        ui.apply_setting(None, "show_cmd2_in_rows")
+        ui.apply_setting(None, "trust_zed_focus")
+        ui.apply_setting(None, "open_threads_menu_on_focus")
+
+        config = RUNNER.load_config()
+        self.assertTrue(ui.focus_zed_on_run)
+        self.assertTrue(ui.multi_command_mode)
+        self.assertTrue(ui.show_cmd2_in_rows)
+        self.assertTrue(ui.trust_zed_focus)
+        self.assertTrue(config["focus_zed_on_run"])
+        self.assertTrue(config["multi_command_mode"])
+        self.assertTrue(config["show_cmd2_in_rows"])
+        self.assertTrue(config["trust_zed_focus"])
+        self.assertTrue(config["open_threads_menu_on_focus"])
+
+    def test_ssh_connections_persist_without_running_command(self) -> None:
+        RUNNER.save_ssh_connections([{"name": "dev-tunnel", "command": "ssh -N devbox"}])
+
+        self.assertEqual(RUNNER.load_ssh_connections(), [{"name": "dev-tunnel", "command": "ssh -N devbox"}])
+
+    def test_ssh_connections_support_auto_start_flag(self) -> None:
+        RUNNER.save_ssh_connections(
+            [
+                {"name": "dev-tunnel", "command": "ssh -N devbox", "auto_start": True},
+                {"name": "manual", "command": "ssh devbox"},
+            ]
+        )
+
+        connections = RUNNER.load_ssh_connections()
+        self.assertTrue(connections[0]["auto_start"])
+        self.assertNotIn("auto_start", connections[1])
+
+    def test_auto_start_only_starts_enabled_ssh_connections(self) -> None:
+        RUNNER.save_ssh_connections(
+            [
+                {"name": "auto", "command": "ssh -N devbox", "auto_start": True},
+                {"name": "manual", "command": "ssh devbox"},
+            ]
+        )
+        ui = RUNNER.RunnerUi([], False, 4, "source")
+        started = []
+        ui.is_ssh_connection_running = lambda name: False
+        ui.start_ssh_connection = lambda connection, quiet=False: started.append(connection["name"]) or True
+
+        ui.auto_start_ssh_connections()
+
+        self.assertEqual(started, ["auto"])
+
+    def test_thread_ssh_dependency_persists_and_starts_before_run(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        thread = RUNNER.ThreadCommand(project=project, command="just dev")
+        ui = RUNNER.RunnerUi([thread], False, 4, "source")
+        RUNNER.save_ssh_connections([{"name": "dev-tunnel", "command": "ssh -N devbox"}])
+        ui.thread_ssh_dependencies = RUNNER.set_thread_ssh_dependency(thread.key, "dev-tunnel")
+        started = []
+        ui.is_ssh_connection_running = lambda name: False
+        ui.start_ssh_connection = lambda connection, quiet=False: started.append(connection["name"]) or True
+
+        self.assertTrue(ui.ensure_thread_ssh_dependency(thread))
+        self.assertEqual(started, ["dev-tunnel"])
+
+    def test_ssh_connection_name_can_be_derived_from_pasted_command(self) -> None:
+        command = "ssh -R 5052:localhost:5174 user@example.test"
+
+        self.assertEqual(RUNNER.ssh_connection_name_from_command(command), "user@example.test")
+
+    def test_ssh_connection_runtime_adds_no_remote_command_for_tunnels(self) -> None:
+        command = "ssh -R 5052:localhost:5174 user@example.test"
+
+        self.assertEqual(
+            RUNNER.ssh_connection_runtime_argv(command),
+            ["ssh", "-N", "-R", "5052:localhost:5174", "user@example.test"],
+        )
+        self.assertEqual(RUNNER.ssh_connection_runtime_argv("ssh -N -R 5052:localhost:5174 user@example.test")[1], "-N")
+
+    def test_ssh_connection_running_restores_from_registry(self) -> None:
+        ui = RUNNER.RunnerUi([], False, 4, "source")
+        RUNNER.save_processes(
+            {
+                "ssh-connection:tunnel": {
+                    "pid": 1,
+                    "pgid": 222,
+                    "command": "ssh -N devbox",
+                    "command_slot": "manual",
+                }
+            }
+        )
+        original_alive = RUNNER.is_pgid_alive
+        RUNNER.is_pgid_alive = lambda pgid: pgid == 222
+        try:
+            self.assertTrue(ui.is_ssh_connection_running("tunnel"))
+        finally:
+            RUNNER.is_pgid_alive = original_alive
+
+    def test_process_dashboard_lists_registered_warm_and_rider_processes(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        thread = RUNNER.ThreadCommand(project=project, command="just dev")
+        ui = RUNNER.RunnerUi([thread], False, 4, "source")
+        RUNNER.save_processes(
+            {
+                thread.key: {"pid": 10, "pgid": 20, "command": "just dev", "command_slot": "1"},
+                "ssh-connection:tunnel": {"pid": 11, "pgid": 21, "command": "ssh -N devbox", "command_slot": "manual"},
+            }
+        )
+
+        class FakeProcess:
+            pid = 30
+
+            def poll(self):
+                return None
+
+        thread.warm_process = FakeProcess()
+        ui.rider_processes[thread.key] = FakeProcess()
+        original_alive = RUNNER.is_pgid_alive
+        RUNNER.is_pgid_alive = lambda pgid: True
+        try:
+            labels = [label for label, _ in ui.process_dashboard_entries()]
+        finally:
+            RUNNER.is_pgid_alive = original_alive
+
+        self.assertTrue(any(label.startswith("cmd") and "just dev" in label for label in labels))
+        self.assertTrue(any(label.startswith("ssh") and "tunnel" in label for label in labels))
+        self.assertTrue(any(label.startswith("warm") for label in labels))
+        self.assertTrue(any(label.startswith("rider") for label in labels))
+
     def test_leader_slot_actions_include_stop_all_and_hide(self) -> None:
         project_a = Path(self.tempdir.name) / "project-a"
         project_b = Path(self.tempdir.name) / "project-b"
@@ -169,6 +494,61 @@ class RunnerStateTests(unittest.TestCase):
 
         self.assertEqual([thread.project for thread in ui.threads], [project_b])
         self.assertEqual(RUNNER.hidden_thread_keys(), {str(project_a)})
+
+    def test_leader_capital_f_focuses_rider_and_unfocuses_previous(self) -> None:
+        project_a = Path(self.tempdir.name) / "project-a"
+        project_b = Path(self.tempdir.name) / "project-b"
+        project_a.mkdir()
+        project_b.mkdir()
+        ui = RUNNER.RunnerUi(
+            [RUNNER.ThreadCommand(project=project_a, command=""), RUNNER.ThreadCommand(project=project_b, command="")],
+            False,
+            4,
+            "source",
+        )
+        ui.slots = {str(project_a): 1, str(project_b): 2}
+        launched = []
+
+        class FakeProcess:
+            def __init__(self, pid):
+                self.pid = pid
+                self.stopped = False
+
+            def poll(self):
+                return 0 if self.stopped else None
+
+        def fake_focus(project):
+            process = FakeProcess(100 + len(launched))
+            launched.append((project, process))
+            return process, f"focused rider: {project.name}"
+
+        original_focus = RUNNER.focus_project_in_rider
+        original_getpgid = RUNNER.os.getpgid
+        original_killpg = RUNNER.os.killpg
+        RUNNER.focus_project_in_rider = fake_focus
+        try:
+            RUNNER.os.getpgid = lambda pid: pid
+
+            def fake_killpg(pgid, signal_number):
+                for _, process in launched:
+                    if process.pid == pgid:
+                        process.stopped = True
+
+            RUNNER.os.killpg = fake_killpg
+            ui.leader_active = True
+            ui.handle_leader_key(None, ord("1"))
+            ui.handle_leader_key(None, ord("F"))
+            ui.leader_active = True
+            ui.handle_leader_key(None, ord("2"))
+            ui.handle_leader_key(None, ord("F"))
+        finally:
+            RUNNER.focus_project_in_rider = original_focus
+            RUNNER.os.getpgid = original_getpgid
+            RUNNER.os.killpg = original_killpg
+
+        self.assertEqual([project for project, _ in launched], [project_a, project_b])
+        self.assertTrue(launched[0][1].stopped)
+        self.assertEqual(list(ui.rider_processes), [str(project_b)])
 
     def test_thread_details_include_local_metadata(self) -> None:
         project = Path(self.tempdir.name) / "project"
@@ -255,6 +635,21 @@ class RunnerStateTests(unittest.TestCase):
         thread.last_status = "missing command"
 
         self.assertTrue(ui.thread_state_attr(thread) & RUNNER.curses.A_BOLD)
+
+    def test_thread_state_attr_marks_running_without_colors(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        ui = RUNNER.RunnerUi([RUNNER.ThreadCommand(project=project, command="")], False, 4, "source")
+        thread = ui.threads[0]
+
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        thread.process = FakeProcess()
+        ui.color_attr = lambda color_pair: color_pair
+
+        self.assertEqual(ui.thread_state_attr(thread) & RUNNER.COLOR_RUNNING, RUNNER.COLOR_RUNNING)
 
     def test_remote_focus_uri_and_key_generation(self) -> None:
         self.assertEqual(RUNNER.remote_thread_key("devbox", "~/code/project alpha"), "ssh:devbox:~/code/project alpha")

@@ -608,6 +608,29 @@ class RunnerStateTests(unittest.TestCase):
         self.assertIn("command: just test", details)
         self.assertIn("nix: flake", details)
 
+    def test_thread_details_include_command_slot_status(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+        RUNNER.save_thread_command_slot(str(project), 1, "just dev")
+        RUNNER.save_thread_command_slot(str(project), 2, "just test")
+        thread = RUNNER.ThreadCommand(project=project, command="just dev")
+        thread.running_slot = "1"
+        thread.registered_pid = 123
+        thread.registered_pgid = 456
+        ui = RUNNER.RunnerUi([thread], False, 4, "source")
+        original_alive = RUNNER.is_pgid_alive
+        try:
+            RUNNER.is_pgid_alive = lambda pgid: pgid == 456
+
+            details = "\n".join(ui.thread_details(thread))
+        finally:
+            RUNNER.is_pgid_alive = original_alive
+
+        self.assertIn("cmd1: just dev", details)
+        self.assertIn("cmd1 status: running pid=123 pgid=456", details)
+        self.assertIn("cmd2: just test", details)
+        self.assertIn("cmd2 status: idle", details)
+
     def test_command_history_picker_empty_state(self) -> None:
         project = Path(self.tempdir.name) / "project"
         project.mkdir()

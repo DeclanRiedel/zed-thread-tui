@@ -1843,6 +1843,21 @@ class RunnerUi:
             return f"c{active}"
         return "cm" if thread.command.strip() else "c-"
 
+    def command_slot_status(self, thread: ThreadCommand, slot: int, process_data: dict[str, int | str]) -> str:
+        slots = command_slot_state(thread.key, self.command_slots)
+        command = slots.get(f"cmd{slot}", "")
+        if not command:
+            return "empty"
+        running_slot = str(process_data.get("command_slot", thread.running_slot))
+        pgid = process_data.get("pgid", thread.registered_pgid)
+        if running_slot == str(slot) and isinstance(pgid, int) and is_pgid_alive(pgid):
+            pid = process_data.get("pid", thread.registered_pid or "-")
+            return f"running pid={pid} pgid={pgid}"
+        active = active_command_slot(thread.key, thread.command, self.command_slots)
+        if active == str(slot):
+            return "active"
+        return "idle"
+
     def compact_name(self, thread: ThreadCommand) -> str:
         name = display_text(thread.name)
         return name[:10] if len(name) > 10 else name
@@ -2974,7 +2989,9 @@ class RunnerUi:
             f"active slot: {self.command_slot_label(thread)}",
             f"running slot: {thread.running_slot}",
             f"cmd1: {slots.get('cmd1') or '<empty>'}",
+            f"cmd1 status: {self.command_slot_status(thread, 1, process_data)}",
             f"cmd2: {slots.get('cmd2') or '<empty>'}",
+            f"cmd2 status: {self.command_slot_status(thread, 2, process_data)}",
             f"status: {thread.last_status}",
             f"pid/pgid: {process_data.get('pid', thread.registered_pid or '-')} / {process_data.get('pgid', thread.registered_pgid or '-')}",
             f"ssh dependency: {dependency} ({dependency_state if dependency != '-' else '-'})",

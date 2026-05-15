@@ -28,6 +28,9 @@ AI_RUNNING_WINDOW_SECONDS = 45
 SORT_MODES = ["source", "name", "running", "failed", "focused", "ai"]
 DEFAULT_SLOT_COUNT = 9
 COMMAND_HISTORY_LIMIT = 25
+LOG_TAIL_READ_BYTES = 64 * 1024
+MAX_LOG_BYTES = 5 * 1024 * 1024
+COMPACTED_LOG_BYTES = 512 * 1024
 COLOR_DEFAULT = 1
 COLOR_RUNNING = 2
 COLOR_FAILED = 3
@@ -90,6 +93,49 @@ def save_config(config: dict[str, object]) -> None:
     target = config_dir() / "config.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+
+def tail_file_lines(path: Path, line_count: int, read_bytes: int = LOG_TAIL_READ_BYTES) -> list[str]:
+    if line_count <= 0:
+        return []
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as log:
+            log.seek(max(0, size - read_bytes))
+            data = log.read()
+    except OSError:
+        return ["<no log yet>"]
+    lines = data.decode(errors="replace").splitlines()
+    if size > read_bytes and lines:
+        lines = lines[1:]
+    return lines[-line_count:] if lines else ["<empty log>"]
+
+
+def compact_log_file(path: Path, max_bytes: int = MAX_LOG_BYTES, keep_bytes: int = COMPACTED_LOG_BYTES) -> bool:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= max_bytes:
+        return False
+    try:
+        with path.open("rb") as source:
+            source.seek(max(0, size - keep_bytes))
+            data = source.read()
+        marker = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] log compacted from {size} bytes\n".encode()
+        path.write_bytes(marker + data)
+    except OSError:
+        return False
+    return True
+
+
+def clear_log_file(path: Path) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] log cleared\n")
+    except OSError:
+        return False
+    return True
 
 
 def remote_path_key(path: str) -> str:
@@ -1492,6 +1538,7 @@ class ThreadCommand:
             self.last_status = "detecting nix"
             nix_kind = detect_remote_nix_kind(str(self.remote_host), str(self.remote_path), self.remote_port)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        compact_log_file(self.log_path)
         with self.log_path.open("ab", buffering=0) as log:
             header = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.command}\n".encode()
             log.write(header)
@@ -1526,6 +1573,7 @@ class ThreadCommand:
                 self.last_status = "no nix shell"
                 return
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            compact_log_file(self.log_path)
             with self.log_path.open("ab", buffering=0) as log:
                 log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] warming remote nix shell ({nix_kind})\n".encode())
                 self.warm_process = subprocess.Popen(
@@ -1545,6 +1593,7 @@ class ThreadCommand:
             self.last_status = "warming"
             return
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        compact_log_file(self.log_path)
         with self.log_path.open("ab", buffering=0) as log:
             log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] warming nix shell\n".encode())
             self.warm_process = subprocess.Popen(
@@ -1726,7 +1775,7 @@ class RunnerUi:
             suffix = f" leader={self.leader_key}:{leader_state} slot={pending} action={leader_action} filter={self.filter_query or '-'} sort={self.sort_mode} view={'compact' if self.compact else 'normal'}"
             status_attr = curses.A_REVERSE if self.leader_active else curses.A_DIM
             self.write_line(stdscr, height - 2, f"{self.message} |{suffix}", status_attr)
-            buttons = "[Focus:f] [Run:s !/@] [Cmd:e/s/P] [Settings:g/G] [SSH:D] [Proc:O] [Stop:x/a] [Info:i] [Quit:q/Q]"
+            buttons = "[Focus:f] [Run:s !/@] [Cmd:e/s/P] [Settings:g/G] [SSH:D] [Proc:O] [Stop:x/a] [Log:t/L] [Info:i] [Quit:q/Q]"
             self.write_line(stdscr, height - 1, buttons, curses.A_REVERSE)
         stdscr.refresh()
 
@@ -2071,6 +2120,8 @@ class RunnerUi:
             self.message = "warming all nix shells"
         elif key == ord("l"):
             self.message = f"log: {self.current.log_path}"
+        elif key == ord("L"):
+            self.clear_current_log()
         elif key in (ord("f"), ord("z")):
             self.focus_current()
         elif key == ord("F"):
@@ -2491,6 +2542,7 @@ class RunnerUi:
             return True
         log_path = ssh_connection_log_path(name)
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        compact_log_file(log_path)
         with log_path.open("ab", buffering=0) as log:
             log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {command}\n".encode())
             try:
@@ -2853,11 +2905,13 @@ class RunnerUi:
         self.message = f"saved preset {name}"
 
     def tail_log(self, line_count: int) -> list[str]:
-        try:
-            lines = self.current.log_path.read_text(errors="replace").splitlines()
-        except OSError:
-            return ["<no log yet>"]
-        return lines[-line_count:] if lines else ["<empty log>"]
+        return tail_file_lines(self.current.log_path, line_count)
+
+    def clear_current_log(self) -> None:
+        if clear_log_file(self.current.log_path):
+            self.message = f"cleared log: {self.current.name}"
+            return
+        self.message = f"failed to clear log: {self.current.name}"
 
     def thread_details(self, thread: ThreadCommand) -> list[str]:
         aliases = load_aliases()
@@ -2901,11 +2955,7 @@ class RunnerUi:
         return details
 
     def thread_log_preview(self, thread: ThreadCommand, line_count: int) -> list[str]:
-        try:
-            lines = thread.log_path.read_text(errors="replace").splitlines()
-        except OSError:
-            return ["<no log yet>"]
-        return lines[-line_count:] if lines else ["<empty log>"]
+        return tail_file_lines(thread.log_path, line_count)
 
     def mark_ai_seen(self, thread: ThreadCommand) -> None:
         state = self.cached_ai_states().get(thread.key)

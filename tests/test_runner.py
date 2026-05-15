@@ -62,6 +62,26 @@ class RunnerStateTests(unittest.TestCase):
         self.assertEqual(RUNNER.nix_wrapper_kind(shell_project), "shell")
         self.assertEqual(RUNNER.nix_wrapper_kind(plain_project), "none")
 
+    def test_tail_file_lines_reads_bounded_tail(self) -> None:
+        log = Path(self.tempdir.name) / "large.log"
+        log.write_text("old\n" + "\n".join(f"line-{index}" for index in range(2000)) + "\n")
+
+        lines = RUNNER.tail_file_lines(log, 3, read_bytes=128)
+
+        self.assertEqual(lines, ["line-1997", "line-1998", "line-1999"])
+
+    def test_compact_log_file_keeps_recent_output(self) -> None:
+        log = Path(self.tempdir.name) / "large.log"
+        log.write_bytes(b"old\n" * 200 + b"recent\n")
+
+        compacted = RUNNER.compact_log_file(log, max_bytes=128, keep_bytes=32)
+
+        self.assertTrue(compacted)
+        content = log.read_text()
+        self.assertIn("log compacted from", content)
+        self.assertIn("recent", content)
+        self.assertLess(log.stat().st_size, 128)
+
     def test_slots_are_stable_and_reassignable(self) -> None:
         base = Path(self.tempdir.name)
         project_a = base / "project-a"

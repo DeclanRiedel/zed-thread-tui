@@ -70,12 +70,13 @@ When the terminal supports color, rows are color-coded by priority: focused, fai
 - `!` / `@`: run selected thread with `cmd1` or `cmd2` when multi-command mode is on.
 - `P`: save the current command into `cmd1` or `cmd2`.
 - `c` / `C`: cycle legacy preset / pick command history.
-- `t`: toggle log tail pane.
+- `t` / `L`: toggle log tail pane / clear selected-thread log.
 - `i`: toggle selected-thread details pane, including command slots, process IDs, nix mode, SSH dependency, and log tail.
 - `g`: open settings popup for persisted runner settings.
 - `G`: open SSH connection manager.
 - `D`: set or clear the selected thread's required SSH connection.
 - `O`: open the tracked process dashboard and stop an entry.
+- `R`: reload local and remote threads from Zed and append new entries to the live TUI.
 - `f`: focus/open selected project in Zed.
 - `p`: add project path.
 - `h` / `H`: hide selected thread / list hidden threads and unhide one.

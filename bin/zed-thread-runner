@@ -1663,9 +1663,19 @@ class ThreadCommand:
 
 
 class RunnerUi:
-    def __init__(self, threads: list[ThreadCommand], focus_zed_on_run: bool, focus_limit: int, sort_mode: str) -> None:
+    def __init__(
+        self,
+        threads: list[ThreadCommand],
+        focus_zed_on_run: bool,
+        focus_limit: int,
+        sort_mode: str,
+        cwd: Path | None = None,
+        default_command: str | None = None,
+    ) -> None:
         self.threads = threads
         self.slots = ensure_slot_keys(thread.key for thread in threads)
+        self.cwd = cwd or Path.cwd().resolve()
+        self.default_command = default_command
         self.focus_zed_on_run = focus_zed_on_run
         self.focus_limit = focus_limit
         self.selected = 0
@@ -1775,7 +1785,7 @@ class RunnerUi:
             suffix = f" leader={self.leader_key}:{leader_state} slot={pending} action={leader_action} filter={self.filter_query or '-'} sort={self.sort_mode} view={'compact' if self.compact else 'normal'}"
             status_attr = curses.A_REVERSE if self.leader_active else curses.A_DIM
             self.write_line(stdscr, height - 2, f"{self.message} |{suffix}", status_attr)
-            buttons = "[Focus:f] [Run:s !/@] [Cmd:e/s/P] [Settings:g/G] [SSH:D] [Proc:O] [Stop:x/a] [Log:t/L] [Info:i] [Quit:q/Q]"
+            buttons = "[Focus:f] [Run:s !/@] [Cmd:e/s/P] [Reload:R] [Settings:g/G] [SSH:D] [Proc:O] [Stop:x/a] [Log:t/L] [Info:i] [Quit:q/Q]"
             self.write_line(stdscr, height - 1, buttons, curses.A_REVERSE)
         stdscr.refresh()
 
@@ -2107,6 +2117,8 @@ class RunnerUi:
                 self.start_current(stop_all_first=False)
         elif key == ord("r"):
             self.start_current(stop_all_first=True)
+        elif key == ord("R"):
+            self.reload_threads_from_zed()
         elif key == ord("x"):
             self.current.stop()
         elif key == ord("a"):
@@ -2820,6 +2832,36 @@ class RunnerUi:
             self.threads.append(ThreadCommand(project=project, command=command, alias=self.aliases.get(str(project))))
             self.slots = ensure_slot_keys(thread.key for thread in self.threads)
             self.selected = len(self.threads) - 1
+
+    def reload_threads_from_zed(self) -> None:
+        existing = {thread.key for thread in self.threads}
+        added: list[ThreadCommand] = []
+
+        zed_projects = zed_thread_projects()
+        if zed_projects:
+            add_projects(zed_projects)
+        hidden = hidden_projects()
+        hidden_keys = hidden_thread_keys()
+        local_threads = build_threads(
+            [project for project in zed_projects if project not in hidden and str(project) not in hidden_keys],
+            self.default_command,
+        )
+        remote_threads = build_remote_threads(self.default_command)
+        for thread in [*local_threads, *remote_threads]:
+            if thread.key in existing:
+                continue
+            self.threads.append(thread)
+            existing.add(thread.key)
+            added.append(thread)
+
+        if added:
+            self.commands = load_commands()
+            self.command_slots = load_command_slots()
+            self.aliases = load_aliases()
+            self.thread_ssh_dependencies = load_thread_ssh_dependencies()
+            self.slots = ensure_slot_keys(thread.key for thread in self.threads)
+            self.selected = self.threads.index(added[0])
+        self.message = f"reloaded Zed threads: +{len(added)} ({len(self.threads)} total)"
 
     def alias_current(self, stdscr: curses.window) -> None:
         thread = self.current
@@ -4289,6 +4331,8 @@ def main(argv: list[str]) -> int:
         focus_zed_on_run=args.focus_zed_on_run,
         focus_limit=args.focus_limit,
         sort_mode=args.sort_mode,
+        cwd=cwd,
+        default_command=args.command,
     )
     try:
         curses.wrapper(ui.run)

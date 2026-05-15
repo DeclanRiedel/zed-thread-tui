@@ -617,6 +617,28 @@ class RunnerStateTests(unittest.TestCase):
 
         self.assertIn("no command history", ui.message)
 
+    def test_reload_threads_from_zed_appends_missing_threads(self) -> None:
+        project_a = Path(self.tempdir.name) / "project-a"
+        project_b = Path(self.tempdir.name) / "project-b"
+        project_a.mkdir()
+        project_b.mkdir()
+        remote = RUNNER.ThreadCommand(project=Path("/srv/project"), command="just dev", remote_host="devbox", remote_path="/srv/project")
+        ui = RUNNER.RunnerUi([RUNNER.ThreadCommand(project=project_a, command="")], False, 4, "source")
+        original_zed_projects = RUNNER.zed_thread_projects
+        original_build_remote_threads = RUNNER.build_remote_threads
+        try:
+            RUNNER.zed_thread_projects = lambda: [project_a, project_b]
+            RUNNER.build_remote_threads = lambda default_command: [remote]
+
+            ui.reload_threads_from_zed()
+            ui.reload_threads_from_zed()
+        finally:
+            RUNNER.zed_thread_projects = original_zed_projects
+            RUNNER.build_remote_threads = original_build_remote_threads
+
+        self.assertEqual([thread.key for thread in ui.threads], [str(project_a), str(project_b), remote.key])
+        self.assertEqual(ui.message, "reloaded Zed threads: +0 (3 total)")
+
     def test_pinned_projects_persist_and_unpin(self) -> None:
         project_a = Path(self.tempdir.name) / "project-a"
         project_b = Path(self.tempdir.name) / "project-b"

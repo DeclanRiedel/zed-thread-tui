@@ -321,7 +321,39 @@ class RunnerStateTests(unittest.TestCase):
         finally:
             RUNNER.os.getpgid = original_getpgid
 
-        self.assertEqual(RUNNER.load_processes()[str(project)]["command_slot"], "1")
+        process_key = RUNNER.command_process_key(str(project), "1")
+        self.assertEqual(RUNNER.load_processes()[process_key]["command_slot"], "1")
+        self.assertEqual(RUNNER.load_processes()[process_key]["thread_key"], str(project))
+
+    def test_command_slots_can_be_registered_concurrently(self) -> None:
+        project = Path(self.tempdir.name) / "project"
+        project.mkdir()
+
+        class FakeProcess:
+            def __init__(self, pid):
+                self.pid = pid
+
+        original_getpgid = RUNNER.os.getpgid
+        original_alive = RUNNER.is_pgid_alive
+        try:
+            RUNNER.os.getpgid = lambda pid: pid + 100
+            RUNNER.is_pgid_alive = lambda pgid: True
+            RUNNER.register_process(project, FakeProcess(10), "just dev", "1")
+            RUNNER.register_process(project, FakeProcess(20), "just test", "2")
+
+            thread = RUNNER.build_threads([project], None)[0]
+            RUNNER.save_thread_command_slot(str(project), 1, "just dev")
+            RUNNER.save_thread_command_slot(str(project), 2, "just test")
+            ui = RUNNER.RunnerUi([thread], False, 4, "source")
+            details = "\n".join(ui.thread_details(thread))
+        finally:
+            RUNNER.os.getpgid = original_getpgid
+            RUNNER.is_pgid_alive = original_alive
+
+        self.assertEqual(set(RUNNER.load_processes()), {RUNNER.command_process_key(str(project), "1"), RUNNER.command_process_key(str(project), "2")})
+        self.assertEqual(thread.running_slot, "1,2")
+        self.assertIn("cmd1 status: running pid=10 pgid=110", details)
+        self.assertIn("cmd2 status: running pid=20 pgid=120", details)
 
     def test_stop_all_registered_processes_keeps_ssh_connections(self) -> None:
         RUNNER.save_processes(
@@ -614,17 +646,22 @@ class RunnerStateTests(unittest.TestCase):
         RUNNER.save_thread_command_slot(str(project), 1, "just dev")
         RUNNER.save_thread_command_slot(str(project), 2, "just test")
         thread = RUNNER.ThreadCommand(project=project, command="just dev")
-        thread.running_slot = "1"
-        thread.registered_pid = 123
-        thread.registered_pgid = 456
         ui = RUNNER.RunnerUi([thread], False, 4, "source")
         original_alive = RUNNER.is_pgid_alive
+        original_getpgid = RUNNER.os.getpgid
+
+        class FakeProcess:
+            pid = 123
+
         try:
+            RUNNER.os.getpgid = lambda pid: 456
             RUNNER.is_pgid_alive = lambda pgid: pgid == 456
+            RUNNER.register_process(project, FakeProcess(), "just dev", "1")
 
             details = "\n".join(ui.thread_details(thread))
         finally:
             RUNNER.is_pgid_alive = original_alive
+            RUNNER.os.getpgid = original_getpgid
 
         self.assertIn("cmd1: just dev", details)
         self.assertIn("cmd1 status: running pid=123 pgid=456", details)

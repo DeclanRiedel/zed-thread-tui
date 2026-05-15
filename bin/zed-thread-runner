@@ -13,7 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -894,17 +894,34 @@ def register_process(project: Path, process: subprocess.Popen[bytes], command: s
     register_process_key(str(project), process, command, command_slot)
 
 
+def command_process_key(key: str, command_slot: str = "manual") -> str:
+    return f"{key}::cmd{command_slot}" if command_slot in ("1", "2") else key
+
+
+def process_thread_key(key: str, data: dict[str, int | str] | None = None) -> str:
+    if data and data.get("thread_key"):
+        return str(data["thread_key"])
+    if "::cmd" in key:
+        return key.rsplit("::cmd", 1)[0]
+    return key
+
+
+def process_entries_for_thread(processes: dict[str, dict[str, int | str]], key: str) -> dict[str, dict[str, int | str]]:
+    return {process_key: data for process_key, data in processes.items() if process_thread_key(process_key, data) == key}
+
+
 def register_process_key(key: str, process: subprocess.Popen[bytes], command: str, command_slot: str = "manual") -> None:
     processes = load_processes()
     try:
         pgid = os.getpgid(process.pid)
     except ProcessLookupError:
         return
-    processes[key] = {
+    processes[command_process_key(key, command_slot)] = {
         "pid": process.pid,
         "pgid": pgid,
         "command": command,
         "command_slot": command_slot,
+        "thread_key": key,
     }
     save_processes(processes)
 
@@ -927,9 +944,17 @@ def unregister_process(project: Path) -> None:
     unregister_process_key(str(project))
 
 
-def unregister_process_key(key: str) -> None:
+def unregister_process_key(key: str, command_slot: str | None = None) -> None:
     processes = load_processes()
-    if processes.pop(key, None) is not None:
+    changed = False
+    if command_slot is not None:
+        changed = processes.pop(command_process_key(key, command_slot), None) is not None
+    else:
+        for process_key, data in list(processes.items()):
+            if process_key == key or process_thread_key(process_key, data) == key:
+                processes.pop(process_key, None)
+                changed = True
+    if changed:
         save_processes(processes)
 
 
@@ -1469,6 +1494,7 @@ class ThreadCommand:
     remote_port: int | None = None
     alias: str | None = None
     process: subprocess.Popen[bytes] | None = None
+    slot_processes: dict[str, subprocess.Popen[bytes]] = field(default_factory=dict)
     warm_process: subprocess.Popen[bytes] | None = None
     registered_pgid: int | None = None
     registered_pid: int | None = None
@@ -1505,6 +1531,15 @@ class ThreadCommand:
         return state_dir() / "logs" / f"{safe}.log"
 
     def poll(self) -> None:
+        live_slots: list[str] = []
+        for slot, process in list(self.slot_processes.items()):
+            exit_code = process.poll()
+            if exit_code is None:
+                live_slots.append(slot)
+                continue
+            self.last_exit = exit_code
+            self.slot_processes.pop(slot, None)
+            unregister_process_key(self.key, slot)
         if self.process is not None:
             exit_code = self.process.poll()
             if exit_code is not None:
@@ -1522,17 +1557,48 @@ class ThreadCommand:
                 self.running_slot = "manual"
                 self.last_status = "exited ?"
                 unregister_process_key(self.key)
+        elif live_slots:
+            self.running_slot = ",".join(sorted(live_slots))
+            self.last_status = "running"
+        else:
+            self.refresh_registered_processes()
         if self.warm_process is not None:
             exit_code = self.warm_process.poll()
             if exit_code is not None:
                 self.last_status = "nix warmed" if exit_code == 0 else f"warm failed {exit_code}"
                 self.warm_process = None
 
+    def refresh_registered_processes(self) -> None:
+        entries = process_entries_for_thread(load_processes(), self.key)
+        live: list[tuple[str, dict[str, int | str]]] = []
+        for process_key, data in entries.items():
+            pgid = data.get("pgid")
+            if isinstance(pgid, int) and is_pgid_alive(pgid):
+                live.append((process_key, data))
+                continue
+            unregister_process_key(process_key)
+        if not live:
+            if self.last_status == "running":
+                self.last_status = "exited ?"
+            self.registered_pgid = None
+            self.registered_pid = None
+            self.running_slot = "manual"
+            return
+        slots = sorted(str(data.get("command_slot", "manual")) for _, data in live)
+        primary = live[0][1]
+        self.registered_pgid = primary.get("pgid") if isinstance(primary.get("pgid"), int) else None
+        self.registered_pid = primary.get("pid") if isinstance(primary.get("pid"), int) else None
+        self.running_slot = ",".join(slots)
+        self.last_status = "running"
+
     def start(self, command_slot: str = "manual") -> None:
         if not self.command.strip():
             self.last_status = "missing command"
             return
-        self.stop()
+        if command_slot in ("1", "2"):
+            self.stop_slot(command_slot)
+        else:
+            self.stop()
         nix_kind = "auto"
         if self.is_remote:
             self.last_status = "detecting nix"
@@ -1543,7 +1609,7 @@ class ThreadCommand:
             header = f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.command}\n".encode()
             log.write(header)
             popen_cwd = None if self.is_remote else self.project
-            self.process = subprocess.Popen(
+            process = subprocess.Popen(
                 self.command_argv(nix_kind),
                 cwd=popen_cwd,
                 stdout=log,
@@ -1551,7 +1617,11 @@ class ThreadCommand:
                 stdin=subprocess.DEVNULL,
                 preexec_fn=os.setsid,
             )
-            register_process_key(self.key, self.process, self.command, command_slot)
+            if command_slot in ("1", "2"):
+                self.slot_processes[command_slot] = process
+            else:
+                self.process = process
+            register_process_key(self.key, process, self.command, command_slot)
         self.last_status = "running"
         self.running_slot = command_slot
         self.last_exit = None
@@ -1608,8 +1678,13 @@ class ThreadCommand:
 
     def stop(self) -> None:
         self.stop_warm()
+        for slot in list(self.slot_processes):
+            self.stop_slot(slot)
         if self.registered_pgid is not None:
-            stop_process_group(self.registered_pgid)
+            for _process_key, data in process_entries_for_thread(load_processes(), self.key).items():
+                pgid = data.get("pgid")
+                if isinstance(pgid, int):
+                    stop_process_group(pgid)
             self.registered_pgid = None
             self.registered_pid = None
             self.running_slot = "manual"
@@ -1639,6 +1714,19 @@ class ThreadCommand:
         self.running_slot = "manual"
         unregister_process_key(self.key)
         self.last_status = "stopped"
+
+    def stop_slot(self, command_slot: str) -> None:
+        process = self.slot_processes.pop(command_slot, None)
+        if process is not None and process.poll() is None:
+            try:
+                stop_process_group(os.getpgid(process.pid))
+            except ProcessLookupError:
+                pass
+        data = load_processes().get(command_process_key(self.key, command_slot))
+        pgid = data.get("pgid") if data else None
+        if isinstance(pgid, int):
+            stop_process_group(pgid)
+        unregister_process_key(self.key, command_slot)
 
     def stop_warm(self) -> None:
         if self.warm_process is None or self.warm_process.poll() is not None:
@@ -1843,16 +1931,28 @@ class RunnerUi:
             return f"c{active}"
         return "cm" if thread.command.strip() else "c-"
 
-    def command_slot_status(self, thread: ThreadCommand, slot: int, process_data: dict[str, int | str]) -> str:
+    def command_slot_status(self, thread: ThreadCommand, slot: int) -> str:
         slots = command_slot_state(thread.key, self.command_slots)
         command = slots.get(f"cmd{slot}", "")
         if not command:
             return "empty"
-        running_slot = str(process_data.get("command_slot", thread.running_slot))
-        pgid = process_data.get("pgid", thread.registered_pgid)
-        if running_slot == str(slot) and isinstance(pgid, int) and is_pgid_alive(pgid):
-            pid = process_data.get("pid", thread.registered_pid or "-")
+        processes = load_processes()
+        process_data = processes.get(command_process_key(thread.key, str(slot)), {})
+        if not process_data:
+            process_data = next(
+                (data for data in process_entries_for_thread(processes, thread.key).values() if str(data.get("command_slot")) == str(slot)),
+                {},
+            )
+        pgid = process_data.get("pgid")
+        if isinstance(pgid, int) and is_pgid_alive(pgid):
+            pid = process_data.get("pid", "-")
             return f"running pid={pid} pgid={pgid}"
+        process = thread.slot_processes.get(str(slot))
+        if process is not None and process.poll() is None:
+            try:
+                return f"running pid={process.pid} pgid={os.getpgid(process.pid)}"
+            except ProcessLookupError:
+                return f"running pid={process.pid}"
         active = active_command_slot(thread.key, thread.command, self.command_slots)
         if active == str(slot):
             return "active"
@@ -2365,7 +2465,9 @@ class RunnerUi:
     def is_running(self, thread: ThreadCommand) -> bool:
         return (
             (thread.process is not None and thread.process.poll() is None)
+            or any(process.poll() is None for process in thread.slot_processes.values())
             or (thread.registered_pgid is not None and is_pgid_alive(thread.registered_pgid))
+            or any(isinstance(data.get("pgid"), int) and is_pgid_alive(int(data["pgid"])) for data in process_entries_for_thread(load_processes(), thread.key).values())
             or (thread.warm_process is not None and thread.warm_process.poll() is None)
         )
 
@@ -2989,9 +3091,9 @@ class RunnerUi:
             f"active slot: {self.command_slot_label(thread)}",
             f"running slot: {thread.running_slot}",
             f"cmd1: {slots.get('cmd1') or '<empty>'}",
-            f"cmd1 status: {self.command_slot_status(thread, 1, process_data)}",
+            f"cmd1 status: {self.command_slot_status(thread, 1)}",
             f"cmd2: {slots.get('cmd2') or '<empty>'}",
-            f"cmd2 status: {self.command_slot_status(thread, 2, process_data)}",
+            f"cmd2 status: {self.command_slot_status(thread, 2)}",
             f"status: {thread.last_status}",
             f"pid/pgid: {process_data.get('pid', thread.registered_pid or '-')} / {process_data.get('pgid', thread.registered_pgid or '-')}",
             f"ssh dependency: {dependency} ({dependency_state if dependency != '-' else '-'})",
@@ -3704,19 +3806,23 @@ def build_threads(projects: list[Path], default_command: str | None) -> list[Thr
     for project in projects:
         command = effective_command_for_key(str(project), default_command, commands)
         thread = ThreadCommand(project=project, command=command, alias=aliases.get(str(project)))
-        process_data = processes.get(str(project))
-        if process_data:
+        entries = process_entries_for_thread(processes, str(project))
+        live_entries: list[dict[str, int | str]] = []
+        for process_key, process_data in entries.items():
             pgid = process_data.get("pgid")
             pid = process_data.get("pid")
-            command = str(process_data.get("command", command))
             if isinstance(pgid, int) and is_pgid_alive(pgid):
-                thread.registered_pgid = pgid
-                thread.registered_pid = pid if isinstance(pid, int) else None
-                thread.command = command
-                thread.running_slot = str(process_data.get("command_slot", "manual"))
-                thread.last_status = "running"
+                live_entries.append(process_data)
             else:
-                unregister_process(project)
+                unregister_process_key(process_key)
+        if live_entries:
+            primary = live_entries[0]
+            command = str(primary.get("command", command))
+            thread.registered_pgid = primary.get("pgid") if isinstance(primary.get("pgid"), int) else None
+            thread.registered_pid = primary.get("pid") if isinstance(primary.get("pid"), int) else None
+            thread.command = command
+            thread.running_slot = ",".join(sorted(str(entry.get("command_slot", "manual")) for entry in live_entries))
+            thread.last_status = "running"
         threads.append(thread)
     return threads
 
@@ -3742,19 +3848,23 @@ def build_remote_threads(default_command: str | None) -> list[ThreadCommand]:
             remote_port=int(spec["port"]) if spec.get("port") else None,
             alias=aliases.get(key),
         )
-        process_data = processes.get(key)
-        if process_data:
+        entries = process_entries_for_thread(processes, key)
+        live_entries: list[dict[str, int | str]] = []
+        for process_key, process_data in entries.items():
             pgid = process_data.get("pgid")
             pid = process_data.get("pid")
-            command = str(process_data.get("command", command))
             if isinstance(pgid, int) and is_pgid_alive(pgid):
-                thread.registered_pgid = pgid
-                thread.registered_pid = pid if isinstance(pid, int) else None
-                thread.command = command
-                thread.running_slot = str(process_data.get("command_slot", "manual"))
-                thread.last_status = "running"
+                live_entries.append(process_data)
             else:
-                unregister_process_key(key)
+                unregister_process_key(process_key)
+        if live_entries:
+            primary = live_entries[0]
+            command = str(primary.get("command", command))
+            thread.registered_pgid = primary.get("pgid") if isinstance(primary.get("pgid"), int) else None
+            thread.registered_pid = primary.get("pid") if isinstance(primary.get("pid"), int) else None
+            thread.command = command
+            thread.running_slot = ",".join(sorted(str(entry.get("command_slot", "manual")) for entry in live_entries))
+            thread.last_status = "running"
         threads.append(thread)
     return threads
 
@@ -3795,7 +3905,8 @@ def run_project(project: Path, command: str | None, focus_zed: bool, stop_all_fi
         message, _ = focus_project_in_zed(project, focus_limit=focus_limit)
         print(message)
     thread.start(command_slot=command_slot)
-    if thread.process is None:
+    process = thread.slot_processes.get(command_slot) if command_slot in ("1", "2") else thread.process
+    if process is None:
         print(thread.last_status, file=sys.stderr)
         return 1
     commands = load_commands()
@@ -3803,7 +3914,7 @@ def run_project(project: Path, command: str | None, focus_zed: bool, stop_all_fi
     save_commands(commands)
     set_active_command_slot(thread.key, command_slot if command_slot in ("1", "2") else active_command_slot(thread.key, thread.command))
     record_command_history(thread.key, thread.command)
-    print(f"running {project}: pid {thread.process.pid}")
+    print(f"running {project}: pid {process.pid}")
     return 0
 
 
@@ -3833,7 +3944,8 @@ def run_slot(slot: int, command: str | None, focus_zed: bool, stop_all_first: bo
         ok, message = focus_remote_in_zed(str(thread.remote_host), str(thread.remote_path))
         print(message, file=sys.stdout if ok else sys.stderr)
     thread.start(command_slot=str(command_slot) if command_slot else "manual")
-    if thread.process is None:
+    process = thread.slot_processes.get(str(command_slot)) if command_slot else thread.process
+    if process is None:
         print(thread.last_status, file=sys.stderr)
         return 1
     commands = load_commands()
@@ -3842,7 +3954,7 @@ def run_slot(slot: int, command: str | None, focus_zed: bool, stop_all_first: bo
     active_slot = str(command_slot) if command_slot else active_command_slot(thread.key, thread.command)
     set_active_command_slot(thread.key, active_slot)
     record_command_history(thread.key, thread.command)
-    print(f"running {thread.key}: pid {thread.process.pid}")
+    print(f"running {thread.key}: pid {process.pid}")
     return 0
 
 
